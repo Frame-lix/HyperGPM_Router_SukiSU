@@ -1,0 +1,3 @@
+#!/sbin/sh
+# KernelSU/SukiSU manager installs module zips directly. Custom recovery is not supported.
+exit 1

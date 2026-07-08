@@ -1,0 +1,6 @@
+# Generated release archives
+*.zip
+
+# Runtime/debug logs
+logs/*
+!logs/.gitkeep
