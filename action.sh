@@ -13,19 +13,25 @@ echo "[2/4] Applying Google Password Manager route..."
 if apply_google_route; then
   echo "done"
 else
-  echo "failed: no Google credential provider found"
+  echo "failed: route was not fully applied; see $(log_file)"
 fi
 echo ""
 echo "[3/4] Collecting report..."
-report=$(collect_report)
-echo "report=$report"
+REPORT_PROGRESS=1
+if report=$(collect_report); then
+  echo "report=$report"
+else
+  report=""
+  echo "failed: report could not be created"
+fi
+unset REPORT_PROGRESS
 echo ""
 echo "[4/4] Opening Credential Provider settings and Google passkey page..."
 open_settings_pages
 echo "done"
 echo ""
-echo "If passkey creation still fails, send this report path/content:"
-echo "$report"
+echo "If passkey creation still fails, review/redact this report before sharing:"
+[ -n "$report" ] && echo "$report" || echo "No report was created."
 echo ""
 echo "Tip: run as root for manual commands:"
 echo "  sh /data/adb/modules/hypergpm-router/bin/hypergpmctl.sh status"

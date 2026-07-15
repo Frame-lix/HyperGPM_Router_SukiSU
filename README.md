@@ -2,9 +2,9 @@
 
 Developer: **framelix**
 
-模块 ID：`hypergpm-router`  
-版本：`0.1.0-alpha`  
-运行环境：SukiSU Ultra / KernelSU 风格 systemless 模块
+- 模块 ID：`hypergpm-router`
+- 版本：`0.1.1-alpha`
+- 运行环境：SukiSU Ultra / KernelSU 风格 systemless 模块
 
 ## 这是什么
 
@@ -28,14 +28,17 @@ Android Credential Manager 会聚合设备上可用的 credential providers，�
 
 ## 功能
 
-- 自动发现 Google Play services 中的凭据服务组件。
+- 优先通过 Android `query-services` 精确发现 Google Play services 中声明的凭据服务组件；仅在 ROM 查询异常时使用有超时限制的 package dump 回退。
 - 优先使用 `com.google.android.gms/.auth.api.credentials.credman.service.PasswordAndPasskeyService` 作为 passkey 创建 provider。
 - 写入 `credential_service` 和 `credential_service_primary`，尽量让 Google provider 排在前面。
 - 写入 `autofill_service`，指向 Google Autofill / Google Password Manager。
 - 重建 provider 列表时尽量过滤 Xiaomi / MIUI / FIDO 相关组件。
+- 对每个 Android 用户分别应用设置，并在写入后回读验证；临时 Binder 事务失败会自动重试，部分写入失败会回滚。
+- Action 与开机 watchdog 使用互斥锁，避免同时发现 provider、备份和写设置时互相干扰。
 - 开机后自动重复应用，减少 HyperOS Settings / SecurityCenter 回写设置的影响。
 - 提供 SukiSU Ultra 模块页 Action 按钮，可一键应用、查看状态、生成诊断报告并打开相关设置页面。
-- 诊断报告保存到 `/data/adb/hypergpm-router/logs/`。
+- 诊断命令均有时间上限并显示采集进度，避免 `dumpsys`、`logcat` 或文件扫描长期阻塞 Action。
+- 诊断报告保存到 `/data/adb/hypergpm-router/logs/`，最多保留最近 5 份。
 - 首次 apply 时备份原始 secure settings，支持手动 restore 和卸载时恢复。
 
 ## 安装
@@ -62,6 +65,8 @@ Android Credential Manager 会聚合设备上可用的 credential providers，�
 /data/adb/hypergpm-router/logs/
 ```
 
+报告可能包含设备型号、系统版本、已安装 provider 组件名和相关系统日志。公开上传或提交 issue 前请先检查并脱敏；模块不会自动上传报告。
+
 ## 手动命令
 
 可以在 root shell 中执行：
@@ -75,6 +80,8 @@ sh /data/adb/modules/hypergpm-router/bin/hypergpmctl.sh open
 sh /data/adb/modules/hypergpm-router/bin/hypergpmctl.sh restore
 sh /data/adb/modules/hypergpm-router/bin/hypergpmctl.sh log
 ```
+
+如果 Action 第 2 步显示 `failed`，先查看 `log` 命令输出。日志会记录失败发生在 provider 查询、设置读取、设置写入还是回读验证；原始 `Failed transaction` 不会再直接打断 Action，模块会最多重试 3 次。
 
 ## 恢复与卸载
 
@@ -143,6 +150,8 @@ HyperPasskey 是一个通过 Xposed / LSPosed hook 修复 HyperOS passkey 行为
 ├── bin/
 │   ├── hypergpmctl.sh
 │   └── watchdog.sh
+├── tests/
+│   └── test_common.sh
 └── META-INF/
 ```
 
@@ -151,6 +160,9 @@ HyperPasskey 是一个通过 Xposed / LSPosed hook 修复 HyperOS passkey 行为
 - [KernelSU module guide](https://kernelsu.org/guide/module.html)
 - [Android Credential Manager provider documentation](https://developer.android.com/identity/sign-in/credential-provider)
 - [Android CredentialProviderService API reference](https://developer.android.com/reference/android/service/credentials/CredentialProviderService)
+- [AOSP Settings.Secure credential settings](https://android.googlesource.com/platform/frameworks/base/+/master/core/java/android/provider/Settings.java)
+- [AOSP CredentialManagerService provider setting logic](https://android.googlesource.com/platform/frameworks/base/+/main/services/credentials/java/com/android/server/credentials/CredentialManagerService.java)
+- [Chromium GPM provider component definition](https://chromium.googlesource.com/chromium/src/+/main/components/webauthn/android/java/src/org/chromium/components/webauthn/CredManHelper.java)
 - [HyperPasskey](https://github.com/Howard20181/HyperPasskey)
 - [KeePassDX issue: Xiaomi passkey provider behavior](https://github.com/Kunzisoft/KeePassDX/issues/2220)
 
@@ -160,4 +172,4 @@ HyperPasskey 是一个通过 Xposed / LSPosed hook 修复 HyperOS passkey 行为
 
 ## 免责声明
 
-这是 `0.1.0-alpha` 实验模块，面向愿意自行排障的高级用户。它会以 root 权限写入 Android secure settings，不同 HyperOS 构建的行为可能不同。发布 issue 时请附带诊断报告；如果 ROM 拒绝该路由，请使用 restore 或卸载模块恢复原设置。
+这是 `0.1.1-alpha` 实验模块，面向愿意自行排障的高级用户。它会以 root 权限写入 Android secure settings，不同 HyperOS 构建的行为可能不同。发布 issue 时请先检查并脱敏诊断报告；如果 ROM 拒绝该路由，请使用 restore 或卸载模块恢复原设置。
