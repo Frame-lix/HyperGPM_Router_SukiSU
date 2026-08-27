@@ -1,6 +1,15 @@
 # Generated release archives
 *.zip
+/dist/
+
+# Local OS metadata
+.DS_Store
 
 # Runtime/debug logs
 logs/*
-!logs/.gitkeep
+
+# Local development and research material
+/development-plan/
+/docs/
+/tests/
+/META-INF/

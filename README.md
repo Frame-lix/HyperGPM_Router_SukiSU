@@ -3,7 +3,7 @@
 Developer: **framelix**
 
 - 模块 ID：`hypergpm-router`
-- 版本：`0.1.1-alpha`
+- 版本：`0.2.0-alpha`
 - 运行环境：SukiSU Ultra / KernelSU 风格 systemless 模块
 
 ## 这是什么
@@ -24,22 +24,35 @@ Android Credential Manager 会聚合设备上可用的 credential providers，�
 - `Settings.Secure.credential_service_primary`
 - `Settings.Secure.autofill_service`
 
-目标 provider 是 Google Play services 中的 Google Password Manager / passkey 服务。
+目标 provider 是 Google Play services 中的 Google Password Manager / passkey 服务。Credential Manager provider 和 Autofill service 会分开判断；默认保守模式不会无条件覆盖用户选择的第三方 Autofill。
 
 ## 功能
 
-- 优先通过 Android `query-services` 精确发现 Google Play services 中声明的凭据服务组件；仅在 ROM 查询异常时使用有超时限制的 package dump 回退。
-- 优先使用 `com.google.android.gms/.auth.api.credentials.credman.service.PasswordAndPasskeyService` 作为 passkey 创建 provider。
-- 写入 `credential_service` 和 `credential_service_primary`，尽量让 Google provider 排在前面。
-- 写入 `autofill_service`，指向 Google Autofill / Google Password Manager。
+- 通过 Android `query-services` 精确发现当前用户可见的服务，并验证 service action 与 `BIND_CREDENTIAL_PROVIDER_SERVICE`；有预算的 package dump 只作兼容回退。
+- 运行时检测 API、HyperOS 主版本、区域、用户解锁状态、GMS 状态、Credential Manager feature、provider 查询能力和 OEM hybrid 限制证据。
+- 写入前生成可解释的 per-user route plan；Google provider 排在前面，同时保留合法第三方 Credential provider。
+- Credential provider 与 Autofill 分开决策。保守模式只在 Autofill 为空、已经是 Google，或当前为 Xiaomi/MIUI Autofill 时切换到经过验证的 GMS Autofill。
 - 重建 provider 列表时尽量过滤 Xiaomi / MIUI / FIDO 相关组件。
-- 对每个 Android 用户分别应用设置，并在写入后回读验证；临时 Binder 事务失败会自动重试，部分写入失败会回滚。
+- 对每个 Android 用户分别应用设置，并在写入后逐键回读；临时 Binder 事务失败会有限重试，部分写入失败只回滚本次事务触及的键。
 - Action 与开机 watchdog 使用互斥锁，避免同时发现 provider、备份和写设置时互相干扰。
-- 开机后自动重复应用，减少 HyperOS Settings / SecurityCenter 回写设置的影响。
+- 开机最多应用一次，15 秒后只读验证一次；如果系统回写设置，只记录分类，不进行重试风暴。
 - 提供 SukiSU Ultra 模块页 Action 按钮，可一键应用、查看状态、生成诊断报告并打开相关设置页面。
-- 诊断命令均有时间上限并显示采集进度，避免 `dumpsys`、`logcat` 或文件扫描长期阻塞 Action。
+- Action 的 status、apply、report、open 是四个独立且有硬超时的进程；前一步失败不会拖死后一步。
+- 诊断报告分为默认 `public` 和显式 `private`；每个 section 及报告总流程都有时间预算，公开报告自动过滤常见账号、网络、设备标识、宿主路径和 token 模式。
 - 诊断报告保存到 `/data/adb/hypergpm-router/logs/`，最多保留最近 5 份。
-- 首次 apply 时备份原始 secure settings，支持手动 restore 和卸载时恢复。
+- 首次写入时备份原始 secure settings。restore/卸载只恢复当前仍等于模块最后写入值的键，保留用户之后的新选择。
+
+## 0.2.0-alpha 新增内容
+
+相较于 `0.1.x`，此版本重点修复 Action 偶发出现 `Failed transaction`，以及 collecting report 长时间无响应的问题：
+
+- Action 的状态检查、路由应用、报告采集和页面打开改为互相隔离的限时步骤，单步失败后仍会继续执行并输出总结。
+- Binder transaction 异常采用有限重试，能够识别“返回码为 0 但输出包含失败信息”的情况；写入后逐键回读，异常时回滚本次事务。
+- 报告采集具有 section 超时和 30 秒总预算，不依赖设备是否提供外部 `timeout` 命令。
+- 新增 public/private 报告模式。默认 public 报告会过滤常见账号、IP、MAC、Android ID、本机路径和 token 模式。
+- 新增 capability snapshot、只读 `plan`、三种兼容模式和 OEM 设置回写分类。
+- 开机任务改为每次启动最多应用一次，随后只读验证，减少重复写入、耗电和与其他模块争用。
+- restore 与卸载增加所有权判断，避免覆盖用户在模块运行后手动选择的新 provider。
 
 ## 安装
 
@@ -53,11 +66,10 @@ Android Credential Manager 会聚合设备上可用的 credential providers，�
 
 点击模块 Action 后会依次执行：
 
-1. 显示当前状态。
-2. 立即应用 Google provider 路由。
-3. 生成诊断报告。
-4. 尝试打开 Android Credential Provider 设置页。
-5. 尝试打开 Google passkey 管理页面。
+1. 显示能力与当前状态。
+2. 使用默认能力模式应用 Google provider 路由。
+3. 生成经过隐私过滤的 public 诊断报告。
+4. 尝试打开 Android Credential Provider 设置页和 Google passkey 管理页面。
 
 报告路径：
 
@@ -65,7 +77,7 @@ Android Credential Manager 会聚合设备上可用的 credential providers，�
 /data/adb/hypergpm-router/logs/
 ```
 
-报告可能包含设备型号、系统版本、已安装 provider 组件名和相关系统日志。公开上传或提交 issue 前请先检查并脱敏；模块不会自动上传报告。
+报告可能包含公开设备型号、系统版本、provider 组件名、相关 secure settings 和经过筛选的 Credential Manager 日志。模块会自动进行基础脱敏，但公开上传或提交 issue 前仍应人工检查；模块不会自动上传报告。
 
 ## 手动命令
 
@@ -74,14 +86,40 @@ Android Credential Manager 会聚合设备上可用的 credential providers，�
 ```sh
 su
 sh /data/adb/modules/hypergpm-router/bin/hypergpmctl.sh status
+sh /data/adb/modules/hypergpm-router/bin/hypergpmctl.sh plan
 sh /data/adb/modules/hypergpm-router/bin/hypergpmctl.sh apply
-sh /data/adb/modules/hypergpm-router/bin/hypergpmctl.sh report
+sh /data/adb/modules/hypergpm-router/bin/hypergpmctl.sh apply force
+sh /data/adb/modules/hypergpm-router/bin/hypergpmctl.sh report public
+sh /data/adb/modules/hypergpm-router/bin/hypergpmctl.sh report private
 sh /data/adb/modules/hypergpm-router/bin/hypergpmctl.sh open
 sh /data/adb/modules/hypergpm-router/bin/hypergpmctl.sh restore
 sh /data/adb/modules/hypergpm-router/bin/hypergpmctl.sh log
 ```
 
-如果 Action 第 2 步显示 `failed`，先查看 `log` 命令输出。日志会记录失败发生在 provider 查询、设置读取、设置写入还是回读验证；原始 `Failed transaction` 不会再直接打断 Action，模块会最多重试 3 次。
+`plan` 只解释计划，不写设置。`apply force` 会显式覆盖兼容保护，也可能替换第三方 Autofill，仅用于主动测试。
+
+如果 Action 第 2 步显示 `failed`，先查看 `log`。结构化事件会记录失败阶段、用户、尝试次数、返回码和短错误；`Failed transaction` 不会再阻止第 3、4 步继续执行。
+
+## 兼容模式与配置
+
+- `conservative`：OS3/API36 的默认模式；保留合法第三方 Credential provider，并避免无条件替换第三方 Autofill。
+- `observe-only`：只检查和报告，不写设置；OS4 和 API37 在本版本中默认使用该模式。
+- `force`：仅供用户明确测试，可能覆盖第三方 Autofill。
+
+可选持久配置文件：
+
+```text
+/data/adb/hypergpm-router/conf/policy.conf
+```
+
+示例：
+
+```ini
+mode=conservative
+manage_autofill=auto
+```
+
+`mode` 支持 `observe-only`、`conservative`、`force`；`manage_autofill` 支持 `auto`、`true`、`false`。未知值和重复键不会执行为 shell 代码，并会回退到能力检测结果。
 
 ## 恢复与卸载
 
@@ -98,7 +136,13 @@ su
 sh /data/adb/modules/hypergpm-router/bin/hypergpmctl.sh restore
 ```
 
-卸载模块时，`uninstall.sh` 也会尽量恢复备份过的设置。
+卸载模块时，`uninstall.sh` 也会进行相同恢复。若某个键已被用户或其他模块修改，HyperGPM 会记录 `skipped_user_changed` 并保留当前值。
+
+## 支持状态
+
+`0.2.0-alpha` 的核心目标是 HyperOS 3 / Android 16（API 36）。Xiaomi 15 与 REDMI K80 类合成 fixtures 已通过，但在完成最终 zip 的真机端到端测试前，不标记任何机型为 `verified`。Xiaomi 14、REDMI K70 升级机型仍为 planned。
+
+OS4 或 API37 在本阶段默认 `observe-only`，不会自动写设置，也不属于本版本的支持声明。
 
 ## 已知限制
 
@@ -150,9 +194,10 @@ HyperPasskey 是一个通过 Xposed / LSPosed hook 修复 HyperOS passkey 行为
 ├── bin/
 │   ├── hypergpmctl.sh
 │   └── watchdog.sh
-├── tests/
-│   └── test_common.sh
-└── META-INF/
+├── skip_mount
+├── README.md
+├── CHANGELOG.md
+└── LICENSE
 ```
 
 ## 参考
@@ -160,8 +205,9 @@ HyperPasskey 是一个通过 Xposed / LSPosed hook 修复 HyperOS passkey 行为
 - [KernelSU module guide](https://kernelsu.org/guide/module.html)
 - [Android Credential Manager provider documentation](https://developer.android.com/identity/sign-in/credential-provider)
 - [Android CredentialProviderService API reference](https://developer.android.com/reference/android/service/credentials/CredentialProviderService)
-- [AOSP Settings.Secure credential settings](https://android.googlesource.com/platform/frameworks/base/+/master/core/java/android/provider/Settings.java)
-- [AOSP CredentialManagerService provider setting logic](https://android.googlesource.com/platform/frameworks/base/+/main/services/credentials/java/com/android/server/credentials/CredentialManagerService.java)
+- [Credential Manager troubleshooting](https://developer.android.com/identity/sign-in/credential-manager-troubleshooting-guide)
+- [AOSP Android 16 Settings.Secure credential settings](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android16-release/core/java/android/provider/Settings.java)
+- [AOSP Android 16 CredentialManagerService](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android16-release/services/credentials/java/com/android/server/credentials/CredentialManagerService.java)
 - [Chromium GPM provider component definition](https://chromium.googlesource.com/chromium/src/+/main/components/webauthn/android/java/src/org/chromium/components/webauthn/CredManHelper.java)
 - [HyperPasskey](https://github.com/Howard20181/HyperPasskey)
 - [KeePassDX issue: Xiaomi passkey provider behavior](https://github.com/Kunzisoft/KeePassDX/issues/2220)
@@ -172,4 +218,4 @@ HyperPasskey 是一个通过 Xposed / LSPosed hook 修复 HyperOS passkey 行为
 
 ## 免责声明
 
-这是 `0.1.1-alpha` 实验模块，面向愿意自行排障的高级用户。它会以 root 权限写入 Android secure settings，不同 HyperOS 构建的行为可能不同。发布 issue 时请先检查并脱敏诊断报告；如果 ROM 拒绝该路由，请使用 restore 或卸载模块恢复原设置。
+这是 `0.2.0-alpha` 实验模块，面向愿意自行排障的高级用户。它会以 root 权限写入 Android secure settings，不同 HyperOS 构建的行为可能不同。发布 issue 时请先检查诊断报告；如果 ROM 拒绝该路由，请使用 restore 或卸载模块恢复原设置。
