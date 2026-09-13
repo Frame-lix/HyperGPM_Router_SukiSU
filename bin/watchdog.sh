@@ -1,19 +1,17 @@
 #!/system/bin/sh
 MODDIR=${0%/*}/..
 . "$MODDIR/common.sh"
-# Wait until Android has finished booting, then exit permanently after the bounded window.
+# Compatibility fallback only. It exits after at most 120 seconds.
 HYPERGPM_WAIT_COUNT=0
-while [ "$(getprop sys.boot_completed 2>/dev/null)" != "1" ] && [ "$HYPERGPM_WAIT_COUNT" -lt 120 ]; do
+while [ "$(getprop sys.boot_completed 2>/dev/null)" != "1" ] && [ "$HYPERGPM_WAIT_COUNT" -lt 60 ]; do
   sleep 2
   HYPERGPM_WAIT_COUNT=$((HYPERGPM_WAIT_COUNT + 1))
 done
 if [ "$(getprop sys.boot_completed 2>/dev/null)" != "1" ]; then
-  log_event watchdog lifecycle all 120 1 timeout boot_not_completed
+  log_event watchdog lifecycle all 60 1 timeout boot_not_completed_120s
   exit 0
 fi
 log "watchdog start"
-# Apply at most once per boot. A later read-only check records OEM rewrites without a retry storm.
-apply_google_route_once_per_boot watchdog >/dev/null 2>&1 || true
-sleep 15
-verify_owned_routes >/dev/null 2>&1 || true
+apply_google_route_once_per_boot service-fallback >/dev/null 2>&1 || true
+verify_owned_routes_once service-fallback >/dev/null 2>&1 || true
 log "watchdog done"

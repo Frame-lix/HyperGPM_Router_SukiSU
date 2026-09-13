@@ -9,7 +9,7 @@ HYPERGPM_REPORT_RESULT=failed
 HYPERGPM_OPEN_RESULT=failed
 
 echo "HyperOS Google Passkey Router"
-echo "Action: inspect, apply conservative route, collect public report, open settings"
+echo "Action: inspect, apply capability-selected route, collect public report, open settings"
 echo ""
 println "Action button pressed"
 echo "[1/4] Current status before applying:"
@@ -20,7 +20,8 @@ else
 fi
 echo ""
 echo "[2/4] Applying Google Password Manager route..."
-if HYPERGPM_EXPLAIN=1 run_with_timeout 30 sh "$HYPERGPM_CTL" apply; then
+if HYPERGPM_EXPLAIN=1 HYPERGPM_LOCK_OWNER=action HYPERGPM_LOCK_WAIT_SECONDS=3 \
+  run_with_timeout 30 sh "$HYPERGPM_CTL" apply; then
   HYPERGPM_APPLY_RESULT=ok
   echo "done"
 else

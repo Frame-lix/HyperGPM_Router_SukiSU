@@ -8,7 +8,13 @@ CONF_DIR=$DATA_DIR/conf
 BACKUP_DIR=$DATA_DIR/backup
 STATE_DIR=$DATA_DIR/state
 APPLY_LOCK_DIR=$DATA_DIR/apply.lock
+PROFILE_FILE=${HYPERGPM_PROFILE_FILE:-$MODDIR/compat-profiles.conf}
+FINGERPRINT_FILE=$STATE_DIR/success.fingerprint
+QUICK_CHECK_FILE=$STATE_DIR/quick-check
+CONFLICT_FILE=$STATE_DIR/conflicts.summary
+MODULES_ROOT=${HYPERGPM_MODULES_ROOT:-/data/adb/modules}
 mkdir -p "$LOG_DIR" "$CONF_DIR" "$BACKUP_DIR" "$STATE_DIR" 2>/dev/null || true
+chmod 0700 "$DATA_DIR" "$LOG_DIR" "$CONF_DIR" "$BACKUP_DIR" "$STATE_DIR" 2>/dev/null || true
 
 GMS_PKG=com.google.android.gms
 CHROME_PKG=com.android.chrome
@@ -28,11 +34,36 @@ QUERY_TIMEOUT_SECONDS=4
 SETTINGS_TIMEOUT_SECONDS=3
 REPORT_TIMEOUT_SECONDS=6
 REPORT_TOTAL_SECONDS=30
+LOG_MAX_BYTES=131072
+CONFLICT_MAX_MODULES=64
+CONFLICT_MAX_FILES=128
+CONFLICT_MAX_FILES_PER_MODULE=12
+CONFLICT_MAX_FILE_BYTES=65536
+CONFLICT_TOTAL_SECONDS=4
 
 now() { date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || toybox date '+%Y-%m-%d %H:%M:%S'; }
 log_file() { echo "$LOG_DIR/router.log"; }
-log() { echo "[$(now)] $*" >> "$(log_file)"; }
+
+rotate_router_log() {
+  local file size
+  file=$(log_file)
+  [ -f "$file" ] || return 0
+  size=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+  case "$size" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$size" -le "$LOG_MAX_BYTES" ] && return 0
+  [ ! -f "$file.1" ] || mv "$file.1" "$file.2" 2>/dev/null || true
+  mv "$file" "$file.1" 2>/dev/null || true
+}
+
+log() {
+  rotate_router_log
+  echo "[$(now)] $*" >> "$(log_file)"
+}
 println() { echo "$*"; log "$*"; }
+
+secure_state_file() {
+  [ -e "$1" ] && chmod 0600 "$1" 2>/dev/null || true
+}
 
 sanitize_event_value() {
   printf '%s' "$1" | tr '\r\n\t ' '____' | cut -c 1-200
@@ -142,6 +173,47 @@ user_state() {
   esac
 }
 
+framework_resource_value() {
+  local user="$1" resource_name="$2" out rc
+  out=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" cmd overlay lookup --user "$user" \
+    android "android:string/$resource_name" 2>/dev/null)
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  printf '%s\n' "$out" | tr -d '\r' | tail -n 1
+}
+
+framework_component_resource_state() {
+  local user="$1" resource_name="$2" value
+  value=$(framework_resource_value "$user" "$resource_name" 2>/dev/null) || {
+    echo unknown
+    return
+  }
+  value=$(printf '%s' "$value" | sed 's/^[^=]*=[[:space:]]*//')
+  if is_component_name "$value"; then
+    echo configured
+  elif [ -z "$value" ] || [ "$value" = null ]; then
+    echo not_configured
+  else
+    echo unknown
+  fi
+}
+
+framework_provider_array_state() {
+  local user="$1" resource_name="$2" out rc value
+  out=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" cmd overlay lookup --user "$user" \
+    android "android:array/$resource_name" 2>/dev/null)
+  rc=$?
+  [ "$rc" -eq 0 ] || { echo unknown; return; }
+  value=$(printf '%s\n' "$out" | tr -d '\r' | sed 's/^[^=]*=[[:space:]]*//' | tail -n 1)
+  if printf '%s\n' "$value" | grep -Eq '[A-Za-z0-9_.-]+/[A-Za-z0-9_.$-]+'; then
+    echo configured
+  elif [ -z "$value" ] || [ "$value" = null ] || [ "$value" = '[]' ]; then
+    echo not_configured
+  else
+    echo unknown
+  fi
+}
+
 credential_feature_state() {
   local value rc
   value=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" pm has-feature android.software.credentials 2>/dev/null)
@@ -152,6 +224,128 @@ credential_feature_state() {
     false|*false*) echo false ;;
     *) echo unknown ;;
   esac
+}
+
+build_stability() {
+  local incremental display_id build_type build_tags codename combined
+  incremental=$(getprop_safe ro.build.version.incremental | tr '[:upper:]' '[:lower:]')
+  display_id=$(getprop_safe ro.build.display.id | tr '[:upper:]' '[:lower:]')
+  build_type=$(getprop_safe ro.build.type | tr '[:upper:]' '[:lower:]')
+  build_tags=$(getprop_safe ro.build.tags | tr '[:upper:]' '[:lower:]')
+  codename=$(getprop_safe ro.build.version.codename)
+  combined="$incremental $display_id"
+  case "$combined" in
+    *beta*|*alpha*|*preview*|*canary*|*developer*|*dev*) echo beta; return ;;
+  esac
+  case "$codename" in
+    ""|REL) ;;
+    *) echo beta; return ;;
+  esac
+  if [ "$build_type" = user ] && printf '%s\n' "$build_tags" | grep -Fq release-keys \
+    && [ "$codename" = REL ]; then
+    echo stable
+  else
+    echo unknown
+  fi
+}
+
+profile_field() {
+  local line="$1" wanted="$2"
+  printf '%s\n' "$line" | awk -F'|' -v wanted="$wanted" '
+    {
+      for (i = 1; i <= NF; i++) {
+        split($i, pair, "=")
+        if (pair[1] == wanted) {
+          count++
+          if (count == 1) value=substr($i, index($i, "=") + 1)
+        }
+      }
+    }
+    END {
+      if (count == 1) { print value; exit 0 }
+      if (count > 1) exit 2
+      exit 1
+    }
+  '
+}
+
+profile_line_is_valid() {
+  local line="$1" id os api stability status auto_apply
+  id=$(profile_field "$line" id 2>/dev/null) || return 1
+  os=$(profile_field "$line" os 2>/dev/null) || return 1
+  api=$(profile_field "$line" api 2>/dev/null) || return 1
+  stability=$(profile_field "$line" stability 2>/dev/null) || return 1
+  status=$(profile_field "$line" status 2>/dev/null) || return 1
+  auto_apply=$(profile_field "$line" auto_apply 2>/dev/null) || return 1
+  printf '%s\n' "$id" | grep -Eq '^[a-z0-9][a-z0-9._-]{2,63}$' || return 1
+  case "$os" in 3|4) ;; *) return 1 ;; esac
+  case "$api" in 36|37) ;; *) return 1 ;; esac
+  case "$stability" in any|beta|stable|unknown) ;; *) return 1 ;; esac
+  case "$status" in planned|reported|verified|unsupported) ;; *) return 1 ;; esac
+  case "$auto_apply" in true|false) ;; *) return 1 ;; esac
+  if [ "$auto_apply" = true ]; then
+    case "$id:$status" in
+      generic-os3-api36:reported|*:verified) ;;
+      *) return 1 ;;
+    esac
+  fi
+  return 0
+}
+
+select_platform_profile() {
+  local os api stability wanted line line_os line_api line_stability
+  os=$(hyperos_major)
+  api=$(platform_api)
+  stability=$(build_stability)
+  [ -f "$PROFILE_FILE" ] || return 1
+  case "$os:$api" in
+    3:36|3:37|4:36|4:37) ;;
+    *) return 1 ;;
+  esac
+  for wanted in "$stability" any; do
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in ""|\#*) continue ;; esac
+      profile_line_is_valid "$line" || continue
+      line_os=$(profile_field "$line" os)
+      line_api=$(profile_field "$line" api)
+      line_stability=$(profile_field "$line" stability)
+      if [ "$line_os" = "$os" ] && [ "$line_api" = "$api" ] \
+        && [ "$line_stability" = "$wanted" ]; then
+        echo "$line"
+        return 0
+      fi
+    done < "$PROFILE_FILE"
+    [ "$wanted" = any ] && break
+  done
+  return 1
+}
+
+platform_profile_field() {
+  local wanted="$1" line
+  line=$(select_platform_profile 2>/dev/null) || return 1
+  profile_field "$line" "$wanted"
+}
+
+platform_profile_id() {
+  platform_profile_field id 2>/dev/null || echo generic-observe
+}
+
+platform_profile_status() {
+  platform_profile_field status 2>/dev/null || echo planned
+}
+
+compatibility_reason() {
+  local feature auto_apply
+  feature=$(credential_feature_state)
+  [ "$feature" != false ] || { echo credential_feature_unavailable; return; }
+  auto_apply=$(platform_profile_field auto_apply 2>/dev/null || echo false)
+  if [ "$auto_apply" = true ]; then
+    echo stage1_foundation_profile
+  elif select_platform_profile >/dev/null 2>&1; then
+    echo profile_requires_device_validation_or_explicit_mode
+  else
+    echo unknown_os_api_or_build_profile
+  fi
 }
 
 read_policy_value() {
@@ -165,7 +359,7 @@ read_policy_value() {
 }
 
 requested_mode() {
-  local explicit="${1:-}" configured api os feature
+  local explicit="${1:-}" configured feature auto_apply
   case "$explicit" in
     observe-only|conservative|force) echo "$explicit"; return ;;
     "") ;;
@@ -177,13 +371,12 @@ requested_mode() {
     observe-only|conservative|force) echo "$configured"; return ;;
   esac
 
-  api=$(platform_api)
-  os=$(hyperos_major)
   feature=$(credential_feature_state)
-  if [ "$api" = "37" ] || [ "$os" = "4" ] || [ "$feature" = "false" ]; then
-    echo observe-only
-  else
+  auto_apply=$(platform_profile_field auto_apply 2>/dev/null || echo false)
+  if [ "$feature" != false ] && [ "$auto_apply" = true ]; then
     echo conservative
+  else
+    echo observe-only
   fi
 }
 
@@ -196,6 +389,169 @@ autofill_policy() {
   esac
 }
 
+cached_conflict_value() {
+  local key="$1"
+  plan_value "$CONFLICT_FILE" "$key" 2>/dev/null || true
+}
+
+conflict_level() {
+  local status writers gms hook
+  status=$(cached_conflict_value scan_status)
+  [ "$status" = ok ] || { echo unknown; return; }
+  writers=$(cached_conflict_value settings_writers)
+  gms=$(cached_conflict_value gms_managers)
+  hook=$(cached_conflict_value deep_hooks)
+  case "$writers:$gms:$hook" in
+    *[!0-9:]*|::) echo unknown ;;
+    0:0:0) echo none ;;
+    *) echo ownership_unclear ;;
+  esac
+}
+
+append_private_id() {
+  local list="$1" id="$2"
+  case "$id" in *[!A-Za-z0-9._-]*|"") id=unidentified ;; esac
+  append_unique_component "$(printf '%s' "$list" | tr ',' ':')" "$id" | tr ':' ','
+}
+
+scan_module_conflicts() {
+  local report_mode="${1:-public}" module_list file_list module file module_id size relative per_module_files
+  local started now scanned_modules scanned_files status writer gms hook framework
+  local writer_count gms_count hook_count framework_count skipped_count
+  local writer_ids gms_ids hook_ids framework_ids temporary_file
+  case "$report_mode" in public|private) ;; *) return 2 ;; esac
+  writer_count=0
+  gms_count=0
+  hook_count=0
+  framework_count=0
+  skipped_count=0
+  scanned_modules=0
+  scanned_files=0
+  writer_ids=""
+  gms_ids=""
+  hook_ids=""
+  framework_ids=""
+  status=ok
+  started=$(epoch_seconds)
+  module_list=$(mktemp "$DATA_DIR/conflict-modules.XXXXXX" 2>/dev/null) || return 1
+  file_list=$(mktemp "$DATA_DIR/conflict-files.XXXXXX" 2>/dev/null) || {
+    rm -f "$module_list" 2>/dev/null || true
+    return 1
+  }
+  if [ ! -d "$MODULES_ROOT" ]; then
+    status=unavailable
+    : > "$module_list"
+  else
+    find "$MODULES_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
+      | head -n "$CONFLICT_MAX_MODULES" > "$module_list"
+  fi
+
+  while IFS= read -r module || [ -n "$module" ]; do
+    [ -d "$module" ] && [ ! -L "$module" ] || { skipped_count=$((skipped_count + 1)); continue; }
+    module_id=${module##*/}
+    [ "$module_id" != hypergpm-router ] || continue
+    scanned_modules=$((scanned_modules + 1))
+    writer=0
+    gms=0
+    hook=0
+    framework=0
+    : > "$file_list"
+    for relative in module.prop service.sh boot-completed.sh post-fs-data.sh action.sh \
+      uninstall.sh common.sh system.prop sepolicy.rule; do
+      [ -f "$module/$relative" ] && [ ! -L "$module/$relative" ] \
+        && printf '%s\n' "$module/$relative" >> "$file_list"
+    done
+    [ ! -d "$module/bin" ] || [ -L "$module/bin" ] \
+      || find "$module/bin" -maxdepth 1 -type f 2>/dev/null >> "$file_list"
+    [ ! -d "$module/system" ] || [ -L "$module/system" ] \
+      || find "$module/system" -maxdepth 3 -type f 2>/dev/null >> "$file_list"
+    per_module_files=0
+    while IFS= read -r file || [ -n "$file" ]; do
+      [ "$per_module_files" -lt "$CONFLICT_MAX_FILES_PER_MODULE" ] || break
+      [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] \
+        || { skipped_count=$((skipped_count + 1)); continue; }
+      size=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+      case "$size" in ''|*[!0-9]*) skipped_count=$((skipped_count + 1)); continue ;; esac
+      [ "$size" -le "$CONFLICT_MAX_FILE_BYTES" ] \
+        || { skipped_count=$((skipped_count + 1)); continue; }
+      per_module_files=$((per_module_files + 1))
+      scanned_files=$((scanned_files + 1))
+      if grep -Eiq 'credential_service(_primary)?|autofill_service' "$file" \
+        && grep -Eiq '(^|[^a-z])(settings|cmd[[:space:]]+settings)[[:space:]]+(put|delete|reset)' "$file"; then
+        writer=1
+      fi
+      if grep -Fiq 'com.google.android.gms' "$file" \
+        && grep -Eiq 'freeze|unfreeze|disable|enable|suspend|unsuspend|denylist|detach|pm[[:space:]]' "$file"; then
+        gms=1
+      fi
+      if grep -Eiq 'hyperpasskey|lsposed|xposed|zygisk|system_server|(^|[^a-z])kpm([^a-z]|$)' "$file" \
+        && grep -Eiq 'credential|passkey|credman|fido' "$file"; then
+        hook=1
+      fi
+      case "$file" in
+        */system/framework/*|*/system/system_ext/*|*/system/product/*|*/system/vendor/*) framework=1 ;;
+      esac
+      if grep -Eiq 'config_oemCredentialManagerDialogComponent|config_defaultCredentialManagerHybridService|CredentialManagerService' "$file"; then
+        framework=1
+      fi
+      [ "$scanned_files" -lt "$CONFLICT_MAX_FILES" ] || { status=limit_reached; break; }
+      now=$(epoch_seconds)
+      if [ "$started" -gt 0 ] 2>/dev/null && [ "$now" -gt 0 ] 2>/dev/null \
+        && [ $((now - started)) -ge "$CONFLICT_TOTAL_SECONDS" ]; then
+        status=timeout
+        break
+      fi
+    done < "$file_list"
+    if [ "$writer" -eq 1 ]; then
+      writer_count=$((writer_count + 1))
+      writer_ids=$(append_private_id "$writer_ids" "$module_id")
+    fi
+    if [ "$gms" -eq 1 ]; then
+      gms_count=$((gms_count + 1))
+      gms_ids=$(append_private_id "$gms_ids" "$module_id")
+    fi
+    if [ "$hook" -eq 1 ]; then
+      hook_count=$((hook_count + 1))
+      hook_ids=$(append_private_id "$hook_ids" "$module_id")
+    fi
+    if [ "$framework" -eq 1 ]; then
+      framework_count=$((framework_count + 1))
+      framework_ids=$(append_private_id "$framework_ids" "$module_id")
+    fi
+    case "$status" in timeout|limit_reached) break ;; esac
+  done < "$module_list"
+
+  temporary_file="$CONFLICT_FILE.tmp.$$"
+  {
+    echo "scan_status=$status"
+    echo "settings_writers=$writer_count"
+    echo "gms_managers=$gms_count"
+    echo "deep_hooks=$hook_count"
+    echo "framework_overlays=$framework_count"
+    echo "modules_scanned=$scanned_modules"
+    echo "files_scanned=$scanned_files"
+    echo "entries_skipped=$skipped_count"
+    echo "scanned_at=$(epoch_seconds)"
+  } > "$temporary_file" 2>/dev/null && mv "$temporary_file" "$CONFLICT_FILE" 2>/dev/null
+  secure_state_file "$CONFLICT_FILE"
+  rm -f "$module_list" "$file_list" 2>/dev/null || true
+
+  cat "$CONFLICT_FILE" 2>/dev/null
+  if [ "$report_mode" = private ]; then
+    echo "settings_writer_ids=${writer_ids:-none}"
+    echo "gms_manager_ids=${gms_ids:-none}"
+    echo "deep_hook_ids=${hook_ids:-none}"
+    echo "framework_overlay_ids=${framework_ids:-none}"
+  fi
+}
+
+modules_identity() {
+  local value
+  [ -d "$MODULES_ROOT" ] || { echo unavailable; return; }
+  value=$(stat -c '%Y' "$MODULES_ROOT" 2>/dev/null || stat -f '%m' "$MODULES_ROOT" 2>/dev/null)
+  case "$value" in ''|*[!0-9]*) echo unknown ;; *) echo "$value" ;; esac
+}
+
 list_users() {
   local users
   users=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" cmd user list 2>/dev/null \
@@ -205,6 +561,121 @@ list_users() {
   else
     echo "$users"
   fi
+}
+
+users_identity() {
+  list_users | tr '\n' ',' | sed 's/,$//'
+}
+
+platform_identity() {
+  local incremental display
+  incremental=$(getprop_safe ro.build.version.incremental)
+  display=$(getprop_safe ro.build.display.id)
+  sanitize_event_value "$(platform_api)|$(hyperos_major)|$(build_stability)|$incremental|$display"
+}
+
+gms_version_identity() {
+  local user="${1:-0}" out version path checksum
+  out=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" cmd package list packages \
+    --show-versioncode --user "$user" "$GMS_PKG" 2>/dev/null || true)
+  version=$(printf '%s\n' "$out" | sed -n \
+    's/.*versionCode[:=][[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
+  if [ -n "$version" ]; then
+    echo "versionCode:$version"
+    return
+  fi
+  path=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" pm path --user "$user" "$GMS_PKG" 2>/dev/null \
+    | head -n 1)
+  if [ -n "$path" ]; then
+    checksum=$(printf '%s' "$path" | cksum 2>/dev/null | awk '{ print $1 ":" $2 }')
+    [ -n "$checksum" ] && echo "pathCksum:$checksum" || echo path:present
+  else
+    echo unavailable
+  fi
+}
+
+settings_get_once() {
+  local user="$1" key="$2" out rc
+  out=$(run_with_timeout "$SETTINGS_TIMEOUT_SECONDS" settings get --user "$user" secure "$key" 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] && ! output_has_transaction_error "$out" || return 1
+  printf '%s\n' "$out" | tr -d '\r'
+}
+
+set_quick_check_result() {
+  local result="$1" reason="$2" temporary_file
+  temporary_file="$QUICK_CHECK_FILE.tmp.$$"
+  {
+    echo "result=$result"
+    echo "reason=$reason"
+    echo "checked_at=$(epoch_seconds)"
+  } > "$temporary_file" 2>/dev/null && mv "$temporary_file" "$QUICK_CHECK_FILE" 2>/dev/null || true
+  secure_state_file "$QUICK_CHECK_FILE"
+}
+
+quick_check_reason() {
+  plan_value "$QUICK_CHECK_FILE" reason 2>/dev/null || echo unavailable
+}
+
+save_route_fingerprint() {
+  local mode="$1" users first_user temporary_file user key value
+  users=$(users_identity)
+  first_user=${users%%,*}
+  [ -n "$first_user" ] || first_user=0
+  temporary_file="$FINGERPRINT_FILE.tmp.$$"
+  {
+    echo "schema=1"
+    echo "mode=$mode"
+    echo "platform=$(platform_identity)"
+    echo "users=$users"
+    echo "gms=$(gms_version_identity "$first_user")"
+    echo "modules=$(modules_identity)"
+    echo "saved_at=$(epoch_seconds)"
+    for user in $(printf '%s\n' "$users" | tr ',' ' '); do
+      for key in credential_service credential_service_primary autofill_service; do
+        value=$(settings_get_once "$user" "$key" 2>/dev/null || echo '<unreadable>')
+        value=$(printf '%s' "$value" | tr '\r\n' '__')
+        echo "user_${user}_${key}=$value"
+      done
+    done
+  } > "$temporary_file" 2>/dev/null && mv "$temporary_file" "$FINGERPRINT_FILE" 2>/dev/null \
+    || return 1
+  secure_state_file "$FINGERPRINT_FILE"
+  return 0
+}
+
+quick_route_check() {
+  local mode="$1" expected actual users first_user user state_file key
+  [ -f "$FINGERPRINT_FILE" ] || { set_quick_check_result changed fingerprint_missing; return 1; }
+  expected=$(plan_value "$FINGERPRINT_FILE" schema)
+  [ "$expected" = 1 ] || { set_quick_check_result changed fingerprint_schema; return 1; }
+  expected=$(plan_value "$FINGERPRINT_FILE" mode)
+  [ "$expected" = "$mode" ] || { set_quick_check_result changed mode_changed; return 1; }
+  expected=$(plan_value "$FINGERPRINT_FILE" platform)
+  actual=$(platform_identity)
+  [ "$expected" = "$actual" ] || { set_quick_check_result changed platform_changed; return 1; }
+  users=$(users_identity)
+  expected=$(plan_value "$FINGERPRINT_FILE" users)
+  [ "$expected" = "$users" ] || { set_quick_check_result changed users_changed; return 1; }
+  first_user=${users%%,*}
+  [ -n "$first_user" ] || first_user=0
+  expected=$(plan_value "$FINGERPRINT_FILE" gms)
+  actual=$(gms_version_identity "$first_user")
+  [ "$expected" = "$actual" ] || { set_quick_check_result changed gms_changed; return 1; }
+  expected=$(plan_value "$FINGERPRINT_FILE" modules)
+  actual=$(modules_identity)
+  [ "$expected" = "$actual" ] || { set_quick_check_result changed modules_changed; return 1; }
+
+  for user in $(printf '%s\n' "$users" | tr ',' ' '); do
+    for key in credential_service credential_service_primary autofill_service; do
+      expected=$(plan_value "$FINGERPRINT_FILE" "user_${user}_${key}")
+      actual=$(settings_get_once "$user" "$key" 2>/dev/null || echo '<unreadable>')
+      [ "$actual" = "$expected" ] \
+        || { set_quick_check_result drift "route_drift:$user:$key"; return 1; }
+    done
+  done
+  set_quick_check_result stable fingerprint_match
+  return 0
 }
 
 settings_get() {
@@ -370,7 +841,10 @@ discover_gms_credential_providers() {
   standard_details=$(query_service_details "$user" "$CREDENTIAL_PROVIDER_ACTION" "$GMS_PKG") || standard_details=""
   system_details=$(query_service_details "$user" "$SYSTEM_CREDENTIAL_PROVIDER_ACTION" "$GMS_PKG") || system_details=""
   raw=$(printf '%s\n%s\n' "$standard" "$system" | extract_gms_components)
-  dump=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" dumpsys package "$GMS_PKG" 2>/dev/null || true)
+  dump=""
+  if [ "${HYPERGPM_ALLOW_PACKAGE_DUMP:-1}" = 1 ]; then
+    dump=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" dumpsys package "$GMS_PKG" 2>/dev/null || true)
+  fi
 
   if [ -z "$raw" ] && dump_declares_service "$dump" "$GMS_PASSKEY_COMPONENT" \
     "$CREDENTIAL_PROVIDER_ACTION" "$CREDENTIAL_PROVIDER_PERMISSION"; then
@@ -427,9 +901,15 @@ service_permission_in_details() {
     .*) cls="${comp%%/*}${cls}" ;;
   esac
   printf '%s\n' "$details" | awk -v cls="$cls" -v permission="$permission" '
-    /^[[:space:]]*Service #[0-9]+:/ { matched=0 }
-    index($0, "name=" cls) { matched=1 }
-    matched && index($0, "permission=" permission) { valid=1 }
+    /^[[:space:]]*(Service|ResolveInfo) #[0-9]+:/ { matched=0 }
+    {
+      compact=$0
+      gsub(/[[:space:]]/, "", compact)
+    }
+    index(compact, "name=" cls) || index(compact, "name:" cls) { matched=1 }
+    matched && (index(compact, "permission=" permission) || index(compact, "permission:" permission)) {
+      valid=1
+    }
     END { exit(valid ? 0 : 1) }
   '
 }
@@ -451,6 +931,7 @@ provider_query_state() {
     echo supported
     return
   fi
+  [ "${HYPERGPM_ALLOW_PACKAGE_DUMP:-1}" = 1 ] || { echo failed; return; }
   dump=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" dumpsys package "$GMS_PKG" 2>/dev/null || true)
   if dump_declares_service "$dump" "$GMS_PASSKEY_COMPONENT" \
     "$CREDENTIAL_PROVIDER_ACTION" "$CREDENTIAL_PROVIDER_PERMISSION"; then
@@ -467,7 +948,10 @@ discover_gms_autofill_services() {
   raw=$(query_service_components "$user" "$AUTOFILL_SERVICE_ACTION" "$GMS_PKG" 2>/dev/null \
     | extract_gms_components || true)
   details=$(query_service_details "$user" "$AUTOFILL_SERVICE_ACTION" "$GMS_PKG" 2>/dev/null || true)
-  dump=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" dumpsys package "$GMS_PKG" 2>/dev/null || true)
+  dump=""
+  if [ "${HYPERGPM_ALLOW_PACKAGE_DUMP:-1}" = 1 ]; then
+    dump=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" dumpsys package "$GMS_PKG" 2>/dev/null || true)
+  fi
   for provider in $raw; do
     if service_permission_in_details "$details" "$provider" "$AUTOFILL_SERVICE_PERMISSION" \
       || service_permission_visible "$dump" "$provider" "$AUTOFILL_SERVICE_PERMISSION"; then
@@ -536,6 +1020,7 @@ backup_settings_once() {
     echo "autofill_service=$autofill_value"
   } > "$temporary_file" 2>/dev/null || return 1
   mv "$temporary_file" "$backup_file" 2>/dev/null || return 1
+  secure_state_file "$backup_file"
 }
 
 plan_value() {
@@ -553,16 +1038,35 @@ is_oem_provider() {
   printf '%s\n' "$1" | grep -Eiq 'xiaomi|miui|com\.fido\.asm|mipass'
 }
 
+stored_failure_class() {
+  local value
+  value=$(sed -n '1p' "$STATE_DIR/last-failure-class" 2>/dev/null)
+  case "$value" in
+    settings_rewritten_by_oem|deep_oem_hybrid_restriction|no_create_options|settings_binder_transient|unknown|none) echo "$value" ;;
+    *) echo none ;;
+  esac
+}
+
+failure_evidence_for_route() {
+  if [ "${HYPERGPM_BOOT_PATH:-0}" = 1 ]; then
+    stored_failure_class
+  else
+    classify_recent_failure
+  fi
+}
+
 plan_google_route_for_user() {
   local user="$1" mode="$2" plan_file="$3"
   local providers primary current current_primary current_autofill newlist provider kept removed
-  local state autofill_provider autofill_mode autofill_action autofill_reason action reason
-  local ownership_file owned_credential owned_primary owned_autofill owned_autofill_managed
+  local state autofill_provider autofill_mode autofill_action autofill_reason action reason failure_evidence
+  local credential_action primary_action credential_key_state primary_key_state autofill_key_state
+  local ownership_file owned_credential owned_primary owned_autofill owned_credential_managed
+  local owned_primary_managed owned_autofill_managed
 
   : > "$plan_file" 2>/dev/null || return 1
   state=$(user_state "$user")
   action=apply
-  reason=os3_api36_settings_route
+  reason=capability_gated_settings_route
   providers=""
   primary=""
   current=""
@@ -571,7 +1075,12 @@ plan_google_route_for_user() {
   newlist=""
   removed=""
   autofill_provider=""
+  credential_action=set
+  primary_action=set
   autofill_action=preserve
+  credential_key_state=present
+  primary_key_state=present
+  autofill_key_state=present
   autofill_reason=credential_and_autofill_are_independent
 
   if [ "$state" = "locked" ]; then
@@ -580,6 +1089,18 @@ plan_google_route_for_user() {
   elif [ "$mode" = "observe-only" ]; then
     action=observe
     reason=compatibility_mode_observe_only
+  fi
+
+  if [ "$action" = apply ]; then
+    if [ "$(credential_feature_state)" = false ]; then
+      action=blocked
+      reason=credential_feature_unavailable
+    fi
+    failure_evidence=$(failure_evidence_for_route)
+    if [ "$failure_evidence" = deep_oem_hybrid_restriction ]; then
+      action=blocked
+      reason=deep_oem_hybrid_restriction
+    fi
   fi
 
   if [ "$state" = "locked" ]; then
@@ -591,13 +1112,18 @@ plan_google_route_for_user() {
     write_plan_value "$plan_file" credential_provider ""
     write_plan_value "$plan_file" current_credential_service ""
     write_plan_value "$plan_file" target_credential_service ""
+    write_plan_value "$plan_file" credential_service_action unsupported
+    write_plan_value "$plan_file" credential_service_state user_locked
     write_plan_value "$plan_file" current_credential_service_primary ""
     write_plan_value "$plan_file" target_credential_service_primary ""
+    write_plan_value "$plan_file" credential_service_primary_action unsupported
+    write_plan_value "$plan_file" credential_service_primary_state user_locked
     write_plan_value "$plan_file" removed_providers ""
     write_plan_value "$plan_file" kept_provider_count 0
     write_plan_value "$plan_file" current_autofill_service ""
     write_plan_value "$plan_file" gms_autofill_provider ""
-    write_plan_value "$plan_file" autofill_action preserve
+    write_plan_value "$plan_file" autofill_action unsupported
+    write_plan_value "$plan_file" autofill_service_state user_locked
     write_plan_value "$plan_file" autofill_reason user_locked
     return 0
   fi
@@ -616,29 +1142,50 @@ plan_google_route_for_user() {
   fi
 
   current=$(settings_get "$user" credential_service) || {
-    action=blocked
-    reason=settings_not_readable
-    current="<read-failed>"
+    credential_action=unsupported
+    credential_key_state=unsupported
+    current=""
   }
   current_primary=$(settings_get "$user" credential_service_primary) || {
-    action=blocked
-    reason=settings_not_readable
-    current_primary="<read-failed>"
+    primary_action=unsupported
+    primary_key_state=unsupported
+    current_primary=""
   }
   current_autofill=$(settings_get "$user" autofill_service) || {
-    action=blocked
-    reason=settings_not_readable
-    current_autofill="<read-failed>"
+    autofill_action=unsupported
+    autofill_key_state=unsupported
+    autofill_reason=setting_not_supported_or_not_readable
+    current_autofill=""
   }
   [ "$current" = "null" ] && current=""
+  [ "$current_primary" = "null" ] && current_primary=""
+  [ "$current_autofill" = "null" ] && current_autofill=""
+
+  if [ "$action" = apply ]; then
+    if [ "$credential_action" = unsupported ] && [ "$primary_action" = unsupported ]; then
+      action=blocked
+      reason=credential_settings_unsupported
+    elif [ "$mode" != force ] \
+      && { [ "$credential_action" = unsupported ] || [ "$primary_action" = unsupported ]; }; then
+      action=blocked
+      reason=required_credential_setting_unsupported
+    elif [ "$credential_action" = unsupported ] || [ "$primary_action" = unsupported ]; then
+      reason=force_partial_setting_support
+    fi
+  fi
 
   ownership_file="$STATE_DIR/user_${user}.last"
   if [ "$action" = "apply" ] && [ "$mode" = "conservative" ] && [ -f "$ownership_file" ]; then
     owned_credential=$(plan_value "$ownership_file" credential_service)
     owned_primary=$(plan_value "$ownership_file" credential_service_primary)
     owned_autofill=$(plan_value "$ownership_file" autofill_service)
+    owned_credential_managed=$(plan_value "$ownership_file" credential_service_managed)
+    owned_primary_managed=$(plan_value "$ownership_file" credential_service_primary_managed)
     owned_autofill_managed=$(plan_value "$ownership_file" autofill_managed)
-    if [ "$current" != "$owned_credential" ] || [ "$current_primary" != "$owned_primary" ] \
+    [ -n "$owned_credential_managed" ] || owned_credential_managed=1
+    [ -n "$owned_primary_managed" ] || owned_primary_managed=1
+    if { [ "$owned_credential_managed" = 1 ] && [ "$current" != "$owned_credential" ]; } \
+      || { [ "$owned_primary_managed" = 1 ] && [ "$current_primary" != "$owned_primary" ]; } \
       || { [ "$owned_autofill_managed" = "1" ] && [ "$current_autofill" != "$owned_autofill" ]; }; then
       action=skip
       reason=selection_changed_since_last_apply
@@ -661,7 +1208,8 @@ plan_google_route_for_user() {
 
   autofill_provider=$(choose_gms_autofill_provider "$user")
   autofill_mode=$(autofill_policy)
-  if [ "$action" = "apply" ] && [ -n "$autofill_provider" ] && [ "$autofill_mode" != "false" ]; then
+  if [ "$autofill_action" != unsupported ] && [ "$action" = "apply" ] \
+    && [ -n "$autofill_provider" ] && [ "$autofill_mode" != "false" ]; then
     case "$mode:$autofill_mode:$current_autofill" in
       force:*:*|*:true:*)
         autofill_action=set
@@ -699,13 +1247,18 @@ plan_google_route_for_user() {
   write_plan_value "$plan_file" credential_provider "$primary"
   write_plan_value "$plan_file" current_credential_service "$current"
   write_plan_value "$plan_file" target_credential_service "$newlist"
+  write_plan_value "$plan_file" credential_service_action "$credential_action"
+  write_plan_value "$plan_file" credential_service_state "$credential_key_state"
   write_plan_value "$plan_file" current_credential_service_primary "$current_primary"
   write_plan_value "$plan_file" target_credential_service_primary "$primary"
+  write_plan_value "$plan_file" credential_service_primary_action "$primary_action"
+  write_plan_value "$plan_file" credential_service_primary_state "$primary_key_state"
   write_plan_value "$plan_file" removed_providers "$removed"
   write_plan_value "$plan_file" kept_provider_count "$kept"
   write_plan_value "$plan_file" current_autofill_service "$current_autofill"
   write_plan_value "$plan_file" gms_autofill_provider "$autofill_provider"
   write_plan_value "$plan_file" autofill_action "$autofill_action"
+  write_plan_value "$plan_file" autofill_service_state "$autofill_key_state"
   write_plan_value "$plan_file" autofill_reason "$autofill_reason"
 }
 
@@ -713,10 +1266,10 @@ print_route_plan_file() {
   local plan_file="$1"
   echo "user=$(plan_value "$plan_file" user) mode=$(plan_value "$plan_file" mode) action=$(plan_value "$plan_file" action)"
   echo "reason=$(plan_value "$plan_file" reason)"
-  echo "credential_service: $(plan_value "$plan_file" current_credential_service) -> $(plan_value "$plan_file" target_credential_service)"
-  echo "credential_service_primary: $(plan_value "$plan_file" current_credential_service_primary) -> $(plan_value "$plan_file" target_credential_service_primary)"
+  echo "credential_service action=$(plan_value "$plan_file" credential_service_action) state=$(plan_value "$plan_file" credential_service_state): $(plan_value "$plan_file" current_credential_service) -> $(plan_value "$plan_file" target_credential_service)"
+  echo "credential_service_primary action=$(plan_value "$plan_file" credential_service_primary_action) state=$(plan_value "$plan_file" credential_service_primary_state): $(plan_value "$plan_file" current_credential_service_primary) -> $(plan_value "$plan_file" target_credential_service_primary)"
   echo "removed_providers=$(plan_value "$plan_file" removed_providers)"
-  echo "autofill_action=$(plan_value "$plan_file" autofill_action) reason=$(plan_value "$plan_file" autofill_reason)"
+  echo "autofill_action=$(plan_value "$plan_file" autofill_action) state=$(plan_value "$plan_file" autofill_service_state) reason=$(plan_value "$plan_file" autofill_reason)"
   echo "autofill_service: $(plan_value "$plan_file" current_autofill_service) -> $(plan_value "$plan_file" gms_autofill_provider)"
 }
 
@@ -764,37 +1317,62 @@ restore_key_value() {
 }
 
 record_route_ownership() {
-  local user="$1" credential="$2" primary="$3" autofill_managed="$4" autofill="$5"
+  local user="$1" credential_managed="$2" credential="$3" primary_managed="$4" primary="$5"
+  local autofill_managed="$6" autofill="$7" reason="${8:-route_apply}"
   local state_file="$STATE_DIR/user_${user}.last" temporary_file
   temporary_file="$state_file.tmp.$$"
   {
+    echo "credential_service_managed=$credential_managed"
     echo "credential_service=$credential"
+    echo "credential_service_primary_managed=$primary_managed"
     echo "credential_service_primary=$primary"
     echo "autofill_managed=$autofill_managed"
     echo "autofill_service=$autofill"
+    echo "applied_at=$(epoch_seconds)"
+    echo "reason=$(sanitize_event_value "$reason")"
   } > "$temporary_file" 2>/dev/null || return 1
   mv "$temporary_file" "$state_file" 2>/dev/null || return 1
+  secure_state_file "$state_file"
   printf '%s\n' none > "$STATE_DIR/last-failure-class" 2>/dev/null || true
+  rm -f "$STATE_DIR/ownership-conflict" 2>/dev/null || true
   return 0
 }
 
+ownership_key_managed() {
+  local state_file="$1" key="$2" managed
+  case "$key" in
+    autofill_service)
+      managed=$(plan_value "$state_file" autofill_managed)
+      [ -n "$managed" ] || managed=0
+      ;;
+    *)
+      managed=$(plan_value "$state_file" "${key}_managed")
+      [ -n "$managed" ] || managed=1
+      ;;
+  esac
+  case "$managed" in 1) return 0 ;; *) return 1 ;; esac
+}
+
 restore_settings() {
-  local user backup_file state_file key original last current managed user_rc rc
+  local restore_mode="${1:-safe}" user backup_file state_file key original last current user_rc rc
+  case "$restore_mode" in safe|force) ;; *) return 2 ;; esac
   rc=0
   for user in $(list_users); do
     backup_file="$BACKUP_DIR/user_${user}.secure"
     state_file="$STATE_DIR/user_${user}.last"
     [ -f "$backup_file" ] && [ -f "$state_file" ] || continue
     user_rc=0
-    managed=$(plan_value "$state_file" autofill_managed)
     for key in credential_service credential_service_primary autofill_service; do
-      [ "$key" = "autofill_service" ] && [ "$managed" != "1" ] && continue
+      ownership_key_managed "$state_file" "$key" || continue
       original=$(plan_value "$backup_file" "$key")
       last=$(plan_value "$state_file" "$key")
       current=$(settings_get "$user" "$key") || { user_rc=1; continue; }
       if [ "$current" != "$last" ]; then
-        log_event restore secure "$user" 1 0 skipped_user_changed "$key"
-        continue
+        if [ "$restore_mode" = safe ]; then
+          log_event restore secure "$user" 1 0 skipped_user_changed "$key"
+          continue
+        fi
+        log_event restore secure "$user" 1 0 force_user_changed "$key"
       fi
       if restore_key_value "$user" "$key" "$original"; then
         log_event restore secure "$user" 1 0 restored "$key"
@@ -808,15 +1386,21 @@ restore_settings() {
       rc=1
     fi
   done
+  rm -f "$FINGERPRINT_FILE" "$QUICK_CHECK_FILE" 2>/dev/null || true
   return "$rc"
 }
 
 acquire_apply_lock() {
-  local attempt owner
+  local owner_type="${1:-${HYPERGPM_LOCK_OWNER:-manual}}" max_wait="${2:-${HYPERGPM_LOCK_WAIT_SECONDS:-5}}"
+  local attempt owner existing_type started waited
+  case "$max_wait" in ''|*[!0-9]*) max_wait=5 ;; esac
   attempt=1
-  while [ "$attempt" -le 10 ]; do
+  started=$(epoch_seconds)
+  while [ "$attempt" -le $((max_wait + 1)) ]; do
     if mkdir "$APPLY_LOCK_DIR" 2>/dev/null; then
       echo "$$" > "$APPLY_LOCK_DIR/pid" 2>/dev/null || true
+      echo "$(sanitize_event_value "$owner_type")" > "$APPLY_LOCK_DIR/type" 2>/dev/null || true
+      echo "$started" > "$APPLY_LOCK_DIR/started_at" 2>/dev/null || true
       return 0
     fi
     owner=$(cat "$APPLY_LOCK_DIR/pid" 2>/dev/null)
@@ -829,9 +1413,19 @@ acquire_apply_lock() {
       continue
     fi
     attempt=$((attempt + 1))
+    [ "$attempt" -le $((max_wait + 1)) ] || break
     sleep 1
   done
-  log "apply lock busy; owner=${owner:-unknown}"
+  existing_type=$(cat "$APPLY_LOCK_DIR/type" 2>/dev/null)
+  waited=$(epoch_seconds)
+  if [ "$started" -gt 0 ] 2>/dev/null && [ "$waited" -ge "$started" ] 2>/dev/null; then
+    waited=$((waited - started))
+  else
+    waited=$max_wait
+  fi
+  log "apply lock busy; owner_type=${existing_type:-unknown} waited=${waited}s"
+  [ "${HYPERGPM_EXPLAIN:-0}" = 1 ] \
+    && echo "apply lock busy: owner=${existing_type:-unknown}, waited=${waited}s" >&2
   return 1
 }
 
@@ -841,7 +1435,8 @@ release_apply_lock() {
 
 apply_google_route_for_user() {
   local user="$1" mode="$2" plan_file action current current_primary current_autofill
-  local target target_primary autofill_action target_autofill changed_credential changed_primary changed_autofill
+  local target target_primary credential_action primary_action autofill_action target_autofill
+  local changed_credential changed_primary changed_autofill partial_rc
 
   plan_file=$(mktemp "$DATA_DIR/plan.XXXXXX" 2>/dev/null) || return 1
   plan_google_route_for_user "$user" "$mode" "$plan_file" || {
@@ -858,6 +1453,7 @@ apply_google_route_for_user() {
       ;;
     blocked)
       log_event route_plan secure "$user" 1 1 blocked "$(plan_value "$plan_file" reason)"
+      printf '%s\n' "$(plan_value "$plan_file" reason)" > "$STATE_DIR/last-apply-class" 2>/dev/null || true
       rm -f "$plan_file" 2>/dev/null || true
       return 1
       ;;
@@ -868,13 +1464,17 @@ apply_google_route_for_user() {
   current_autofill=$(plan_value "$plan_file" current_autofill_service)
   target=$(plan_value "$plan_file" target_credential_service)
   target_primary=$(plan_value "$plan_file" target_credential_service_primary)
+  credential_action=$(plan_value "$plan_file" credential_service_action)
+  primary_action=$(plan_value "$plan_file" credential_service_primary_action)
   autofill_action=$(plan_value "$plan_file" autofill_action)
   target_autofill=$(plan_value "$plan_file" gms_autofill_provider)
   changed_credential=0
   changed_primary=0
   changed_autofill=0
+  partial_rc=0
 
-  if [ "$current" = "$target" ] && [ "$current_primary" = "$target_primary" ] \
+  if { [ "$credential_action" != set ] || [ "$current" = "$target" ]; } \
+    && { [ "$primary_action" != set ] || [ "$current_primary" = "$target_primary" ]; } \
     && { [ "$autofill_action" != "set" ] || [ "$current_autofill" = "$target_autofill" ]; }; then
     log_event route_apply secure "$user" 1 0 no_changes already_matches_plan
     rm -f "$plan_file" 2>/dev/null || true
@@ -887,22 +1487,37 @@ apply_google_route_for_user() {
     return 1
   }
 
-  if [ "$current" != "$target" ]; then
-    settings_put "$user" credential_service "$target" || {
+  if [ "$credential_action" = set ] && [ "$current" != "$target" ]; then
+    if settings_put "$user" credential_service "$target"; then
+      changed_credential=1
+    else
       restore_key_value "$user" credential_service "$current" || true
-      rm -f "$plan_file" 2>/dev/null || true
-      return 1
-    }
-    changed_credential=1
+      if [ "$mode" = force ]; then
+        credential_action=unsupported
+        partial_rc=1
+        log_event route_apply secure "$user" 1 1 unsupported_setting credential_service
+      else
+        rm -f "$plan_file" 2>/dev/null || true
+        printf '%s\n' settings_binder_transient > "$STATE_DIR/last-apply-class" 2>/dev/null || true
+        return 1
+      fi
+    fi
   fi
-  if [ "$current_primary" != "$target_primary" ]; then
+  if [ "$primary_action" = set ] && [ "$current_primary" != "$target_primary" ]; then
     if settings_put "$user" credential_service_primary "$target_primary"; then
       changed_primary=1
     else
       restore_key_value "$user" credential_service_primary "$current_primary" || true
-      [ "$changed_credential" -eq 1 ] && restore_key_value "$user" credential_service "$current" || true
-      rm -f "$plan_file" 2>/dev/null || true
-      return 1
+      if [ "$mode" = force ]; then
+        primary_action=unsupported
+        partial_rc=1
+        log_event route_apply secure "$user" 1 1 unsupported_setting credential_service_primary
+      else
+        [ "$changed_credential" -eq 1 ] && restore_key_value "$user" credential_service "$current" || true
+        rm -f "$plan_file" 2>/dev/null || true
+        printf '%s\n' settings_binder_transient > "$STATE_DIR/last-apply-class" 2>/dev/null || true
+        return 1
+      fi
     fi
   fi
   if [ "$autofill_action" = "set" ] && [ "$current_autofill" != "$target_autofill" ]; then
@@ -910,15 +1525,16 @@ apply_google_route_for_user() {
       changed_autofill=1
     else
       restore_key_value "$user" autofill_service "$current_autofill" || true
-      [ "$changed_primary" -eq 1 ] && restore_key_value "$user" credential_service_primary "$current_primary" || true
-      [ "$changed_credential" -eq 1 ] && restore_key_value "$user" credential_service "$current" || true
-      rm -f "$plan_file" 2>/dev/null || true
-      return 1
+      autofill_action=unsupported
+      partial_rc=1
+      log_event route_apply secure "$user" 1 1 unsupported_setting autofill_service
     fi
   fi
 
-  if ! record_route_ownership "$user" "$target" "$target_primary" \
-    "$([ "$autofill_action" = "set" ] && echo 1 || echo 0)" "$target_autofill"; then
+  if ! record_route_ownership "$user" \
+    "$([ "$credential_action" = set ] && echo 1 || echo 0)" "$target" \
+    "$([ "$primary_action" = set ] && echo 1 || echo 0)" "$target_primary" \
+    "$([ "$autofill_action" = set ] && echo 1 || echo 0)" "$target_autofill" "$mode"; then
     [ "$changed_autofill" -eq 1 ] && restore_key_value "$user" autofill_service "$current_autofill" || true
     [ "$changed_primary" -eq 1 ] && restore_key_value "$user" credential_service_primary "$current_primary" || true
     [ "$changed_credential" -eq 1 ] && restore_key_value "$user" credential_service "$current" || true
@@ -926,9 +1542,14 @@ apply_google_route_for_user() {
     return 1
   fi
 
-  log_event route_apply secure "$user" 1 0 ok "writes=$((changed_credential + changed_primary + changed_autofill))"
+  if [ "$partial_rc" -eq 0 ]; then
+    printf '%s\n' none > "$STATE_DIR/last-apply-class" 2>/dev/null || true
+    log_event route_apply secure "$user" 1 0 ok "writes=$((changed_credential + changed_primary + changed_autofill))"
+  else
+    log_event route_apply secure "$user" 1 1 partial "writes=$((changed_credential + changed_primary + changed_autofill))"
+  fi
   rm -f "$plan_file" 2>/dev/null || true
-  return 0
+  return "$partial_rc"
 }
 
 apply_google_route_locked() {
@@ -942,15 +1563,62 @@ apply_google_route_locked() {
   return "$rc"
 }
 
+apply_google_route_under_lock() {
+  local explicit="$1" mode="$2" rc quick_reason level temporary_file
+  if quick_route_check "$mode"; then
+    log_event route_apply fingerprint all 1 0 stable fingerprint_match
+    return 0
+  fi
+  quick_reason=$(quick_check_reason)
+  if [ "${HYPERGPM_BOOT_PATH:-0}" = 1 ]; then
+    case "$quick_reason" in
+      route_drift:*)
+        temporary_file="$STATE_DIR/ownership-conflict.tmp.$$"
+        {
+          echo "state=detected"
+          echo "reason=$quick_reason"
+          echo "detected_at=$(epoch_seconds)"
+        } > "$temporary_file" 2>/dev/null \
+          && mv "$temporary_file" "$STATE_DIR/ownership-conflict" 2>/dev/null || true
+        secure_state_file "$STATE_DIR/ownership-conflict"
+        log_event route_apply ownership all 1 0 stopped "$quick_reason"
+        return 0
+        ;;
+    esac
+  fi
+
+  if [ "${HYPERGPM_SKIP_CONFLICT_REFRESH:-0}" != 1 ]; then
+    scan_module_conflicts public >/dev/null 2>&1 || true
+  fi
+  level=$(conflict_level)
+  if [ -z "$explicit" ] && [ "$level" = ownership_unclear ]; then
+    mode=observe-only
+    log_event route_apply conflict all 1 0 downgraded ownership_unclear
+    [ "${HYPERGPM_EXPLAIN:-0}" = 1 ] \
+      && echo "conflict guard: automatic mode downgraded to observe-only" >&2
+  fi
+
+  apply_google_route_locked "$mode"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    save_route_fingerprint "$mode" || {
+      log_event route_apply fingerprint all 1 1 failed save_failed
+      return 1
+    }
+  fi
+  return "$rc"
+}
+
 apply_google_route() {
-  local explicit="${1:-}" mode rc
+  local explicit="${1:-}" mode rc owner
   mode=$(requested_mode "$explicit")
   [ "$mode" != "invalid" ] || {
     log_event route_apply policy all 1 2 invalid_mode "$explicit"
     return 2
   }
-  acquire_apply_lock || return 1
-  apply_google_route_locked "$mode"
+  owner=${HYPERGPM_LOCK_OWNER:-manual}
+  acquire_apply_lock "$owner" || return 1
+  apply_google_route_under_lock "$explicit" "$mode"
   rc=$?
   release_apply_lock
   return "$rc"
@@ -965,7 +1633,8 @@ current_boot_id() {
 }
 
 apply_google_route_once_per_boot() {
-  local source="${1:-boot}" marker_file="$STATE_DIR/boot-apply" boot_id previous mode rc
+  local source="${1:-boot}" marker_file="$STATE_DIR/boot-apply" boot_id previous mode rc class attempt
+  local HYPERGPM_BOOT_PATH=1 HYPERGPM_ALLOW_PACKAGE_DUMP=0 HYPERGPM_LOCK_OWNER="$source"
   boot_id=$(current_boot_id)
   previous=$(plan_value "$marker_file" boot_id 2>/dev/null || true)
   if [ "$boot_id" != "unknown" ] && [ "$previous" = "$boot_id" ]; then
@@ -973,23 +1642,39 @@ apply_google_route_once_per_boot() {
     return 0
   fi
 
-  acquire_apply_lock || return 1
+  acquire_apply_lock "$source" 5 || return 1
   previous=$(plan_value "$marker_file" boot_id 2>/dev/null || true)
   if [ "$boot_id" != "unknown" ] && [ "$previous" = "$boot_id" ]; then
     release_apply_lock
     return 0
   fi
   mode=$(requested_mode "")
-  apply_google_route_locked "$mode"
+  attempt=1
+  apply_google_route_under_lock "" "$mode"
   rc=$?
+  if [ "$rc" -ne 0 ]; then
+    class=$(sed -n '1p' "$STATE_DIR/last-apply-class" 2>/dev/null)
+    case "$class" in
+      provider_missing_or_invalid|settings_binder_transient)
+        sleep 5
+        HYPERGPM_SKIP_CONFLICT_REFRESH=1
+        attempt=2
+        apply_google_route_under_lock "" "$mode"
+        rc=$?
+        ;;
+    esac
+  fi
   {
     echo "boot_id=$boot_id"
     echo "source=$source"
     echo "mode=$mode"
     echo "result=$rc"
+    echo "attempts=$attempt"
+    echo "finished_at=$(epoch_seconds)"
   } > "$marker_file.tmp.$$" 2>/dev/null && mv "$marker_file.tmp.$$" "$marker_file" 2>/dev/null || true
+  secure_state_file "$marker_file"
   release_apply_lock
-  log_event boot_apply lifecycle all 1 "$rc" attempted "$source:$mode"
+  log_event boot_apply lifecycle all "$attempt" "$rc" attempted "$source:$mode"
   return "$rc"
 }
 
@@ -1019,14 +1704,13 @@ classify_recent_failure() {
 }
 
 verify_owned_routes() {
-  local user state_file key managed expected actual rc
+  local user state_file key expected actual rc
   rc=0
   for user in $(list_users); do
     state_file="$STATE_DIR/user_${user}.last"
     [ -f "$state_file" ] || continue
-    managed=$(plan_value "$state_file" autofill_managed)
     for key in credential_service credential_service_primary autofill_service; do
-      [ "$key" = "autofill_service" ] && [ "$managed" != "1" ] && continue
+      ownership_key_managed "$state_file" "$key" || continue
       expected=$(plan_value "$state_file" "$key")
       actual=$(settings_get "$user" "$key") || { rc=1; continue; }
       if [ "$actual" != "$expected" ]; then
@@ -1042,19 +1726,50 @@ verify_owned_routes() {
   return "$rc"
 }
 
+verify_owned_routes_once() {
+  local source="${1:-boot}" marker_file="$STATE_DIR/boot-verify" boot_id previous apply_result quick_result rc
+  boot_id=$(current_boot_id)
+  previous=$(plan_value "$marker_file" boot_id 2>/dev/null || true)
+  [ "$boot_id" = unknown ] || [ "$previous" != "$boot_id" ] || return 0
+  apply_result=$(plan_value "$STATE_DIR/boot-apply" result 2>/dev/null || echo unknown)
+  quick_result=$(plan_value "$QUICK_CHECK_FILE" result 2>/dev/null || echo unknown)
+  if [ "$apply_result" = 0 ] || [ "$quick_result" = stable ]; then
+    rc=0
+  else
+    verify_owned_routes
+    rc=$?
+  fi
+  {
+    echo "boot_id=$boot_id"
+    echo "source=$source"
+    echo "result=$rc"
+    echo "finished_at=$(epoch_seconds)"
+  } > "$marker_file.tmp.$$" 2>/dev/null && mv "$marker_file.tmp.$$" "$marker_file" 2>/dev/null || true
+  secure_state_file "$marker_file"
+  return "$rc"
+}
+
 capability_snapshot() {
   local user="${1:-0}" mode providers autofill secure_state failure stored_failure profile reason
+  local profile_status stability credential_key_state primary_key_state autofill_key_state auto_apply
   mode=$(requested_mode "")
   providers=$(choose_gms_provider_list "$user")
   autofill=$(choose_gms_autofill_provider "$user")
-  if settings_get "$user" credential_service >/dev/null 2>&1 \
-    && settings_get "$user" credential_service_primary >/dev/null 2>&1 \
-    && settings_get "$user" autofill_service >/dev/null 2>&1; then
+  settings_get "$user" credential_service >/dev/null 2>&1 \
+    && credential_key_state=present || credential_key_state=unsupported
+  settings_get "$user" credential_service_primary >/dev/null 2>&1 \
+    && primary_key_state=present || primary_key_state=unsupported
+  settings_get "$user" autofill_service >/dev/null 2>&1 \
+    && autofill_key_state=present || autofill_key_state=unsupported
+  if [ "$credential_key_state:$primary_key_state:$autofill_key_state" = present:present:present ]; then
     if [ -f "$STATE_DIR/user_${user}.last" ]; then
       secure_state=writable
     else
       secure_state=present
     fi
+  elif [ "$credential_key_state" = present ] || [ "$primary_key_state" = present ] \
+    || [ "$autofill_key_state" = present ]; then
+    secure_state=partial
   else
     secure_state=unknown
   fi
@@ -1073,26 +1788,42 @@ capability_snapshot() {
       [ "$stored_failure" = none ] || failure=$stored_failure
       ;;
   esac
-  case "$(hyperos_major):$(platform_api)" in
-    3:36) profile=generic-os3-api36 ;;
-    *) profile=generic-observe ;;
-  esac
+  profile=$(platform_profile_id)
+  profile_status=$(platform_profile_status)
+  stability=$(build_stability)
+  auto_apply=$(platform_profile_field auto_apply 2>/dev/null || echo false)
   case "$mode" in
-    observe-only) reason=os4_or_api37_not_supported_in_stage1 ;;
-    conservative) reason=os3_api36_or_legacy_conservative_route ;;
-    force) reason=user_explicit_force ;;
+    observe-only) reason=$(compatibility_reason) ;;
+    conservative)
+      if [ "$auto_apply" = true ]; then
+        reason=stage1_foundation_profile
+      else
+        reason=user_or_policy_explicit_conservative
+      fi
+      ;;
+    force) reason=user_or_policy_explicit_force ;;
   esac
   echo "platform_api=$(platform_api)"
   echo "hyperos_major=$(hyperos_major)"
   echo "region=$(device_region)"
+  echo "build_stability=$stability"
   echo "profile=$profile"
+  echo "profile_status=$profile_status"
   echo "user_state=$(user_state "$user")"
   echo "gms_state=$(gms_state "$user")"
   echo "credential_feature=$(credential_feature_state)"
   echo "provider_query=$(provider_query_state "$user")"
   echo "secure_keys=$secure_state"
+  echo "credential_service_key=$credential_key_state"
+  echo "credential_service_primary_key=$primary_key_state"
+  echo "autofill_service_key=$autofill_key_state"
   echo "gms_credential_provider=${providers%%:*}"
   echo "gms_autofill_provider=$autofill"
+  echo "oem_dialog_resource=$(framework_component_resource_state "$user" config_oemCredentialManagerDialogComponent)"
+  echo "hybrid_service_resource=$(framework_component_resource_state "$user" config_defaultCredentialManagerHybridService)"
+  echo "credential_autofill_resource=$(framework_component_resource_state "$user" config_defaultCredentialManagerAutofillService)"
+  echo "default_provider_resource=$(framework_provider_array_state "$user" config_enabledCredentialProviderService)"
+  echo "primary_provider_resource=$(framework_provider_array_state "$user" config_primaryCredentialProviderService)"
   case "$failure" in
     deep_oem_hybrid_restriction) echo "oem_hybrid=detected" ;;
     unknown) echo "oem_hybrid=unknown" ;;
@@ -1101,6 +1832,14 @@ capability_snapshot() {
   echo "failure_class=$failure"
   echo "compat_mode=$mode"
   echo "compat_reason=$reason"
+  echo "quick_check=$(plan_value "$QUICK_CHECK_FILE" result 2>/dev/null || echo unavailable)"
+  echo "quick_check_reason=$(quick_check_reason)"
+  echo "conflict_scan=$(cached_conflict_value scan_status)"
+  echo "conflict_level=$(conflict_level)"
+  echo "conflict_settings_writers=$(cached_conflict_value settings_writers)"
+  echo "conflict_gms_managers=$(cached_conflict_value gms_managers)"
+  echo "conflict_deep_hooks=$(cached_conflict_value deep_hooks)"
+  echo "conflict_framework_overlays=$(cached_conflict_value framework_overlays)"
 }
 
 show_status() {
@@ -1278,6 +2017,13 @@ collect_report() {
     echo ""
   } >> "$raw_file"
 
+  report_progress "bounded module conflict scan"
+  {
+    echo "=== Module conflict summary ==="
+    scan_module_conflicts "$report_mode" 2>/dev/null || echo "scan_status=failed"
+    echo ""
+  } >> "$raw_file"
+
   report_progress "device, providers and secure settings"
   (
     HYPERGPM_DISABLE_TIMEOUT_CMD=1
@@ -1363,10 +2109,23 @@ collect_report() {
 }
 
 open_settings_pages() {
-  run_with_timeout 4 am start -a android.settings.CREDENTIAL_PROVIDER >/dev/null 2>&1 || true
+  local settings_rc browser_rc
+  run_with_timeout 4 am start -a android.settings.CREDENTIAL_PROVIDER >/dev/null 2>&1
+  settings_rc=$?
+  log_event open activity all 1 "$settings_rc" credential_provider_settings android.settings.CREDENTIAL_PROVIDER
   sleep 1
   run_with_timeout 4 am start -a android.intent.action.VIEW \
-    -d 'https://myaccount.google.com/signinoptions/passkeys' -p "$CHROME_PKG" >/dev/null 2>&1 \
-    || run_with_timeout 4 am start -a android.intent.action.VIEW \
-      -d 'https://myaccount.google.com/signinoptions/passkeys' >/dev/null 2>&1 || true
+    -d 'https://myaccount.google.com/signinoptions/passkeys' -p "$CHROME_PKG" >/dev/null 2>&1
+  browser_rc=$?
+  if [ "$browser_rc" -ne 0 ]; then
+    run_with_timeout 4 am start -a android.intent.action.VIEW \
+      -d 'https://myaccount.google.com/signinoptions/passkeys' >/dev/null 2>&1
+    browser_rc=$?
+  fi
+  log_event open activity all 1 "$browser_rc" google_passkey_page android.intent.action.VIEW
+  if [ "$settings_rc" -ne 0 ] && [ "$browser_rc" -ne 0 ]; then
+    echo "Could not open settings automatically; open Passwords, passkeys and autofill manually." >&2
+    return 1
+  fi
+  return 0
 }

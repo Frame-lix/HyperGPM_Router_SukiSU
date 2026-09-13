@@ -10,3 +10,4 @@ chmod 0755 "$MODPATH/post-fs-data.sh" 2>/dev/null || true
 chmod 0755 "$MODPATH/uninstall.sh" 2>/dev/null || true
 chmod 0755 "$MODPATH/bin"/*.sh 2>/dev/null || true
 mkdir -p /data/adb/hypergpm-router/logs 2>/dev/null || true
+chmod 0700 /data/adb/hypergpm-router /data/adb/hypergpm-router/logs 2>/dev/null || true
