@@ -2,6 +2,32 @@
 
 All notable changes to HyperOS Google Passkey Router for SukiSU are recorded here.
 
+## 1.0.0 - 2026-09-15
+
+### Changed
+
+- Consolidated settings retries, field parsing and report capture; reused discovered services within status snapshots and removed successful-read event noise.
+- Versioned success fingerprints now include policy/profile/module content, unlocked users, GMS identity and readable route values. Stable matches still validate selected services by action and exact binding permission for each user.
+- Observation, locked users, partial failures and unreadable settings no longer produce a successful cache entry.
+- Conflict scans bound enumeration as well as content, ignore disabled/removal-pending modules, refresh on public CLI apply and explicit modes, and treat incomplete scans as unknown. Automatic mode observes when ownership cannot be established.
+- Boot checks prior route ownership independently of cache invalidation; restore persists an automatic-routing pause until an explicit apply resumes it.
+- Apply, restore and uninstall share process-identity locks with stale-owner recovery and owner-only release.
+
+### Recovery and resource bounds
+
+- Added pre-write transaction journals and commit identities. Recovery rolls back only values still equal to an interrupted transaction's target, respects locked users, and preserves later external changes.
+- Added per-key original-backup flags while retaining legacy backups across upgrade.
+- Unified command deadlines and descendant termination without requiring external timeout; bounded no-newline output and nested capture storage.
+- Boot routing, deferred-user retry and verification share a 90-second window. Compatibility fallback has a 120-second boot wait and a 210-second outer ceiling, plus cleanup overhead.
+- Reports use unique capture files and classify already captured evidence instead of collecting an additional logcat sample. Reports preserve previously verified drift warnings; shared failure-state writes are atomic.
+
+### Validation and release status
+
+- Host regression coverage includes capability profiles, third-party providers, key-level rollback, old-state restore, cache invalidation, Action isolation, report redaction, real concurrent locks, timed-out descendants and SIGKILL recovery before/after writes and ownership commit.
+- Full entrypoint comparison uses the same synthetic Android fixtures for the prior tag and this candidate. Stable apply performs three settings reads, two selected-service queries, and zero settings writes, full discovery, package dumps or logcat calls on the one-user fixture.
+- Release packaging uses a 15-file module allowlist, fixed ZIP timestamps and checksum verification. Local research, tests, development files, device reports and personal files are excluded.
+- Promoted to the 1.0.0 formal release with versionCode 101. Device validation is no longer a release prerequisite; host regression and artifact audits remain required. BusyBox ash and target-device passkey tests have not been performed, compatibility evidence labels remain unchanged, and no device battery-saving percentage is claimed.
+
 ## 0.4.0-beta - 2026-09-06
 
 ### Added

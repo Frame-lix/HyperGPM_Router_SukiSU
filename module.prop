@@ -1,6 +1,6 @@
 id=hypergpm-router
 name=HyperOS Google Passkey Router for SukiSU
-version=0.4.0-beta
-versionCode=40
+version=1.0.0
+versionCode=101
 author=framelix
-description=Capability-aware Google Password Manager routing for HyperOS 3 plus guarded HyperOS 4 and Android 17 support; includes fast stable-state checks, bounded conflict detection, ownership-safe restore, and privacy-filtered reports. Does not steal or bypass credentials.
+description=Capability-aware Google Password Manager routing for HyperOS 3 plus guarded HyperOS 4 and Android 17 support; includes validated stable-state checks, shared write locks, recoverable transactions, bounded diagnostics, and ownership-safe restore. Does not steal or bypass credentials.

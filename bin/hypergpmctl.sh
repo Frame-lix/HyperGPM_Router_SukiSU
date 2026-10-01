@@ -1,8 +1,12 @@
 #!/system/bin/sh
 MODDIR=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)
 . "$MODDIR/common.sh"
+trap 'release_apply_lock' EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 case "$1" in
   apply)
+    HYPERGPM_REFRESH_CONFLICT=1
     apply_google_route "${2:-}"
     rc=$?
     show_status

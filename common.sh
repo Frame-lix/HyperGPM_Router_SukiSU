@@ -13,6 +13,7 @@ FINGERPRINT_FILE=$STATE_DIR/success.fingerprint
 QUICK_CHECK_FILE=$STATE_DIR/quick-check
 CONFLICT_FILE=$STATE_DIR/conflicts.summary
 MODULES_ROOT=${HYPERGPM_MODULES_ROOT:-/data/adb/modules}
+umask 077
 mkdir -p "$LOG_DIR" "$CONF_DIR" "$BACKUP_DIR" "$STATE_DIR" 2>/dev/null || true
 chmod 0700 "$DATA_DIR" "$LOG_DIR" "$CONF_DIR" "$BACKUP_DIR" "$STATE_DIR" 2>/dev/null || true
 
@@ -41,6 +42,10 @@ CONFLICT_MAX_FILES_PER_MODULE=12
 CONFLICT_MAX_FILE_BYTES=65536
 CONFLICT_TOTAL_SECONDS=4
 
+file_size() {
+  stat -c '%s' "$1" 2>/dev/null || stat -f '%z' "$1" 2>/dev/null
+}
+
 now() { date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || toybox date '+%Y-%m-%d %H:%M:%S'; }
 log_file() { echo "$LOG_DIR/router.log"; }
 
@@ -48,7 +53,7 @@ rotate_router_log() {
   local file size
   file=$(log_file)
   [ -f "$file" ] || return 0
-  size=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+  size=$(file_size "$file")
   case "$size" in ''|*[!0-9]*) return 0 ;; esac
   [ "$size" -le "$LOG_MAX_BYTES" ] && return 0
   [ ! -f "$file.1" ] || mv "$file.1" "$file.2" 2>/dev/null || true
@@ -70,58 +75,78 @@ sanitize_event_value() {
 }
 
 log_event() {
-  local phase="$1" category="$2" user="$3" attempt="$4" rc="$5" status="$6" detail="$7"
-  log "event phase=$(sanitize_event_value "$phase") category=$(sanitize_event_value "$category") user=$(sanitize_event_value "$user") attempt=$(sanitize_event_value "$attempt") rc=$(sanitize_event_value "$rc") status=$(sanitize_event_value "$status") detail=$(sanitize_event_value "$detail")"
+  local event
+  event=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" | awk -F '\t' '
+    { for (i=1; i<=7; i++) { gsub(/[\r\n ]/, "_", $i); $i=substr($i,1,200) }
+      printf "event phase=%s category=%s user=%s attempt=%s rc=%s status=%s detail=%s", $1,$2,$3,$4,$5,$6,$7; exit }')
+  log "$event"
 }
 
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
 getprop_safe() { getprop "$1" 2>/dev/null | tr -d '\r'; }
 
-run_with_timeout() {
-  local seconds="$1" temporary_stdout temporary_stderr timeout_marker child watchdog rc
-  shift
-  if [ "${HYPERGPM_DISABLE_TIMEOUT_CMD:-0}" != "1" ] && have_cmd timeout; then
-    timeout "$seconds" "$@"
-    return $?
+terminate_process_tree() {
+  local pid="$1" child children stat line parent
+  case "$pid" in ''|*[!0-9]*) return ;; esac
+  # Stop parents before enumerating children: a stopped shell cannot launch
+  # another settings writer between enumeration and termination.
+  kill -STOP "$pid" 2>/dev/null || return 0
+  children=''
+  if [ -d /proc/self ]; then
+    for stat in /proc/[0-9]*/stat; do
+      IFS= read -r line < "$stat" 2>/dev/null || continue
+      child=${line%% *}; line=${line##*) }; line=${line#* }
+      parent=${line%% *}
+      [ "$parent" != "$pid" ] || children="$children $child"
+    done
+  else
+    children=$(ps -eo pid=,ppid= 2>/dev/null | awk -v parent="$pid" '$2 == parent {print $1}')
   fi
+  for child in $children; do terminate_process_tree "$child"; done
+  kill -KILL "$pid" 2>/dev/null || true
+}
 
-  temporary_stdout=$(mktemp "$DATA_DIR/timeout-out.XXXXXX" 2>/dev/null) || return 125
-  temporary_stderr=$(mktemp "$DATA_DIR/timeout-err.XXXXXX" 2>/dev/null) || {
-    rm -f "$temporary_stdout" 2>/dev/null || true
-    return 125
-  }
-  timeout_marker=$(mktemp "$DATA_DIR/timeout-marker.XXXXXX" 2>/dev/null) || {
-    rm -f "$temporary_stdout" "$temporary_stderr" 2>/dev/null || true
-    return 125
-  }
+run_with_timeout() {
   (
-    unset HYPERGPM_DISABLE_TIMEOUT_CMD
-    "$@"
-  ) > "$temporary_stdout" 2> "$temporary_stderr" &
-  child=$!
-  (
-    timeout_sleeper=""
-    trap '[ -z "$timeout_sleeper" ] || kill "$timeout_sleeper" 2>/dev/null || true; exit 0' TERM INT
-    command sleep "$seconds" &
-    timeout_sleeper=$!
-    wait "$timeout_sleeper" 2>/dev/null || exit 0
-    if kill -0 "$child" 2>/dev/null; then
-      echo timeout > "$timeout_marker"
-      kill "$child" 2>/dev/null || true
-      command sleep 1
-      kill -9 "$child" 2>/dev/null || true
-    fi
-  ) &
-  watchdog=$!
-  wait "$child"
-  rc=$?
-  kill "$watchdog" 2>/dev/null || true
-  wait "$watchdog" 2>/dev/null || true
-  [ -s "$timeout_marker" ] && rc=124
-  cat "$temporary_stdout"
-  cat "$temporary_stderr" >&2
-  rm -f "$temporary_stdout" "$temporary_stderr" "$timeout_marker" 2>/dev/null || true
-  return "$rc"
+    seconds=$1
+    shift
+    HYPERGPM_TIMEOUT_DIR=$(mktemp -d "${HYPERGPM_TIMEOUT_DIR:-$DATA_DIR}/command.XXXXXX") || exit 125
+    export HYPERGPM_TIMEOUT_DIR
+    HYPERGPM_TIMEOUT_CHILD='' HYPERGPM_TIMEOUT_WATCHDOG=''
+    trap 'trap - EXIT INT TERM; [ -z "$HYPERGPM_TIMEOUT_CHILD" ] || terminate_process_tree "$HYPERGPM_TIMEOUT_CHILD"; [ -z "$HYPERGPM_TIMEOUT_WATCHDOG" ] || terminate_process_tree "$HYPERGPM_TIMEOUT_WATCHDOG"; rm -rf "$HYPERGPM_TIMEOUT_DIR"' EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+    # File-size limits also bound diagnostics produced without newline breaks.
+    (
+      ulimit -f 1024 2>/dev/null || exit 125
+      "$@"
+    ) > "$HYPERGPM_TIMEOUT_DIR/out" 2> "$HYPERGPM_TIMEOUT_DIR/err" &
+    HYPERGPM_TIMEOUT_CHILD=$!
+    (
+      command sleep "$seconds" &
+      sleeper=$!
+      trap 'kill "$sleeper" 2>/dev/null; wait "$sleeper" 2>/dev/null; exit 0' TERM INT
+      : > "$HYPERGPM_TIMEOUT_DIR/timer-ready"
+      wait "$sleeper" || exit 0
+      : > "$HYPERGPM_TIMEOUT_DIR/expired"
+      terminate_process_tree "$HYPERGPM_TIMEOUT_CHILD"
+    ) &
+    HYPERGPM_TIMEOUT_WATCHDOG=$!
+    wait "$HYPERGPM_TIMEOUT_CHILD"
+    rc=$?
+    HYPERGPM_TIMEOUT_CHILD=''
+    # A fast child can finish before the timer installs its signal handler.
+    # Wait for that handshake so cancellation cannot orphan its sleep process.
+    while [ ! -f "$HYPERGPM_TIMEOUT_DIR/timer-ready" ] && kill -0 "$HYPERGPM_TIMEOUT_WATCHDOG" 2>/dev/null; do
+      command sleep 0.01
+    done
+    kill "$HYPERGPM_TIMEOUT_WATCHDOG" 2>/dev/null || true
+    wait "$HYPERGPM_TIMEOUT_WATCHDOG" 2>/dev/null || true
+    HYPERGPM_TIMEOUT_WATCHDOG=''
+    [ ! -f "$HYPERGPM_TIMEOUT_DIR/expired" ] || rc=124
+    cat "$HYPERGPM_TIMEOUT_DIR/out"
+    cat "$HYPERGPM_TIMEOUT_DIR/err" >&2
+    exit "$rc"
+  )
 }
 
 output_has_transaction_error() {
@@ -250,23 +275,14 @@ build_stability() {
 }
 
 profile_field() {
-  local line="$1" wanted="$2"
-  printf '%s\n' "$line" | awk -F'|' -v wanted="$wanted" '
-    {
-      for (i = 1; i <= NF; i++) {
-        split($i, pair, "=")
-        if (pair[1] == wanted) {
-          count++
-          if (count == 1) value=substr($i, index($i, "=") + 1)
-        }
-      }
-    }
-    END {
-      if (count == 1) { print value; exit 0 }
-      if (count > 1) exit 2
-      exit 1
-    }
-  '
+  local line="$1" wanted="$2" field value found=0
+  while :; do
+    field=${line%%|*}
+    case "$field" in "$wanted="*) value=${field#*=}; found=$((found + 1)) ;; esac
+    case "$line" in *'|'*) line=${line#*|} ;; *) break ;; esac
+  done
+  [ "$found" -eq 1 ] || return 1
+  printf '%s\n' "$value"
 }
 
 profile_line_is_valid() {
@@ -397,152 +413,105 @@ cached_conflict_value() {
 conflict_level() {
   local status writers gms hook
   status=$(cached_conflict_value scan_status)
-  [ "$status" = ok ] || { echo unknown; return; }
   writers=$(cached_conflict_value settings_writers)
   gms=$(cached_conflict_value gms_managers)
   hook=$(cached_conflict_value deep_hooks)
   case "$writers:$gms:$hook" in
     *[!0-9:]*|::) echo unknown ;;
-    0:0:0) echo none ;;
+    0:0:0) [ "$status" = ok ] && echo none || echo unknown ;;
     *) echo ownership_unclear ;;
   esac
 }
 
-append_private_id() {
-  local list="$1" id="$2"
-  case "$id" in *[!A-Za-z0-9._-]*|"") id=unidentified ;; esac
-  append_unique_component "$(printf '%s' "$list" | tr ',' ':')" "$id" | tr ':' ','
+
+scan_conflicts_worker() {
+  local work="$1" module file size id flags category count=0 files=0 skipped=0 per status=ok
+  local writers=0 managers=0 hooks=0 overlays=0 writer_ids='' manager_ids='' hook_ids='' overlay_ids=''
+  if [ ! -d "$MODULES_ROOT" ]; then
+    status=unavailable
+    : > "$work/modules"
+  else
+    # Read one extra entry so truncation cannot be mistaken for completeness.
+    find "$MODULES_ROOT" -mindepth 1 -maxdepth 1 -type d 2> "$work/find-errors" \
+      | head -n $((CONFLICT_MAX_MODULES + 1)) > "$work/modules"
+    [ ! -s "$work/find-errors" ] || status=incomplete
+  fi
+  while IFS= read -r module; do
+    count=$((count + 1))
+    [ "$count" -le "$CONFLICT_MAX_MODULES" ] || { status=limit_reached; break; }
+    [ -d "$module" ] && [ -r "$module" ] || { status=incomplete; continue; }
+    [ ! -L "$module" ] && [ ! -e "$module/disable" ] && [ ! -e "$module/remove" ] || continue
+    id=${module##*/}
+    [ "$id" != hypergpm-router ] || continue
+    case "$id" in ''|*[!A-Za-z0-9._-]*) id=unidentified ;; esac
+    {
+      for file in module.prop service.sh boot-completed.sh post-fs-data.sh action.sh uninstall.sh common.sh system.prop sepolicy.rule; do
+        [ ! -f "$module/$file" ] || printf '%s\n' "$module/$file"
+      done
+      for file in "$module/bin" "$module/system"; do
+        [ ! -d "$file" ] || [ -L "$file" ] || find "$file" -maxdepth 3 -type f 2>> "$work/find-errors"
+      done
+    } | head -n $((CONFLICT_MAX_FILES_PER_MODULE + 1)) > "$work/files"
+    [ ! -s "$work/find-errors" ] || status=incomplete
+    per=0
+    : > "$work/categories"
+    while IFS= read -r file; do
+      per=$((per + 1)); files=$((files + 1))
+      if [ "$per" -gt "$CONFLICT_MAX_FILES_PER_MODULE" ] || [ "$files" -gt "$CONFLICT_MAX_FILES" ]; then
+        status=limit_reached; break
+      fi
+      if [ -L "$file" ] || [ ! -r "$file" ]; then skipped=$((skipped + 1)); status=incomplete; continue; fi
+      size=$(file_size "$file")
+      case "$size" in ''|*[!0-9]*) skipped=$((skipped + 1)); status=incomplete; continue ;; esac
+      if [ "$size" -gt "$CONFLICT_MAX_FILE_BYTES" ]; then skipped=$((skipped + 1)); status=incomplete; continue; fi
+      # Bound content even if another process grows the file after stat.
+      head -c "$CONFLICT_MAX_FILE_BYTES" "$file" | awk '
+        { line=tolower($0)
+          if (line ~ /credential_service|autofill_service/) setting=1
+          if (line ~ /settings[[:space:]]+(put|delete|reset)/) write=1
+          if (line ~ /com[.]google[.]android[.]gms/) gms=1
+          if (line ~ /freeze|disable|suspend|denylist|detach|pm[[:space:]]/) manager=1
+          if (line ~ /hyperpasskey|lsposed|xposed|zygisk|system_server|kpm/) hook=1
+          if (line ~ /credential|passkey|credman|fido/) credential=1
+          if (line ~ /config_oemcredentialmanagerdialogcomponent|config_defaultcredentialmanagerhybridservice|credentialmanagerservice/) overlay=1 }
+        END { if(setting && write) print "writer"; if(gms && manager) print "manager"
+          if(hook && credential) print "hook"; if(overlay) print "overlay" }' >> "$work/categories"
+      case "$file" in */system/framework/*|*/system/system_ext/*|*/system/product/*|*/system/vendor/*) echo overlay >> "$work/categories" ;; esac
+    done < "$work/files"
+    for category in $(sort -u "$work/categories"); do
+      case "$category" in
+        writer) writers=$((writers + 1)); writer_ids="${writer_ids}${writer_ids:+,}$id" ;;
+        manager) managers=$((managers + 1)); manager_ids="${manager_ids}${manager_ids:+,}$id" ;;
+        hook) hooks=$((hooks + 1)); hook_ids="${hook_ids}${hook_ids:+,}$id" ;;
+        overlay) overlays=$((overlays + 1)); overlay_ids="${overlay_ids}${overlay_ids:+,}$id" ;;
+      esac
+    done
+    [ "$files" -le "$CONFLICT_MAX_FILES" ] || break
+  done < "$work/modules"
+  printf 'scan_status=%s\nsettings_writers=%s\ngms_managers=%s\ndeep_hooks=%s\nframework_overlays=%s\nmodules_scanned=%s\nfiles_scanned=%s\nentries_skipped=%s\n' \
+    "$status" "$writers" "$managers" "$hooks" "$overlays" "$count" "$files" "$skipped" > "$work/summary"
+  printf 'settings_writer_ids=%s\ngms_manager_ids=%s\ndeep_hook_ids=%s\nframework_overlay_ids=%s\n' \
+    "${writer_ids:-none}" "${manager_ids:-none}" "${hook_ids:-none}" "${overlay_ids:-none}" > "$work/private"
 }
 
 scan_module_conflicts() {
-  local report_mode="${1:-public}" module_list file_list module file module_id size relative per_module_files
-  local started now scanned_modules scanned_files status writer gms hook framework
-  local writer_count gms_count hook_count framework_count skipped_count
-  local writer_ids gms_ids hook_ids framework_ids temporary_file
+  local report_mode="${1:-public}" work rc summary status
   case "$report_mode" in public|private) ;; *) return 2 ;; esac
-  writer_count=0
-  gms_count=0
-  hook_count=0
-  framework_count=0
-  skipped_count=0
-  scanned_modules=0
-  scanned_files=0
-  writer_ids=""
-  gms_ids=""
-  hook_ids=""
-  framework_ids=""
-  status=ok
-  started=$(epoch_seconds)
-  module_list=$(mktemp "$DATA_DIR/conflict-modules.XXXXXX" 2>/dev/null) || return 1
-  file_list=$(mktemp "$DATA_DIR/conflict-files.XXXXXX" 2>/dev/null) || {
-    rm -f "$module_list" 2>/dev/null || true
-    return 1
-  }
-  if [ ! -d "$MODULES_ROOT" ]; then
-    status=unavailable
-    : > "$module_list"
-  else
-    find "$MODULES_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
-      | head -n "$CONFLICT_MAX_MODULES" > "$module_list"
+  work=$(mktemp -d "${HYPERGPM_TIMEOUT_DIR:-$DATA_DIR}/scan.XXXXXX") || return 1
+  run_with_timeout "$CONFLICT_TOTAL_SECONDS" scan_conflicts_worker "$work" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    case "$rc" in 124|137|143) status=timeout ;; *) status=failed ;; esac
+    printf 'scan_status=%s\nsettings_writers=0\ngms_managers=0\ndeep_hooks=0\nframework_overlays=0\n' "$status" > "$work/summary"
   fi
-
-  while IFS= read -r module || [ -n "$module" ]; do
-    [ -d "$module" ] && [ ! -L "$module" ] || { skipped_count=$((skipped_count + 1)); continue; }
-    module_id=${module##*/}
-    [ "$module_id" != hypergpm-router ] || continue
-    scanned_modules=$((scanned_modules + 1))
-    writer=0
-    gms=0
-    hook=0
-    framework=0
-    : > "$file_list"
-    for relative in module.prop service.sh boot-completed.sh post-fs-data.sh action.sh \
-      uninstall.sh common.sh system.prop sepolicy.rule; do
-      [ -f "$module/$relative" ] && [ ! -L "$module/$relative" ] \
-        && printf '%s\n' "$module/$relative" >> "$file_list"
-    done
-    [ ! -d "$module/bin" ] || [ -L "$module/bin" ] \
-      || find "$module/bin" -maxdepth 1 -type f 2>/dev/null >> "$file_list"
-    [ ! -d "$module/system" ] || [ -L "$module/system" ] \
-      || find "$module/system" -maxdepth 3 -type f 2>/dev/null >> "$file_list"
-    per_module_files=0
-    while IFS= read -r file || [ -n "$file" ]; do
-      [ "$per_module_files" -lt "$CONFLICT_MAX_FILES_PER_MODULE" ] || break
-      [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] \
-        || { skipped_count=$((skipped_count + 1)); continue; }
-      size=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
-      case "$size" in ''|*[!0-9]*) skipped_count=$((skipped_count + 1)); continue ;; esac
-      [ "$size" -le "$CONFLICT_MAX_FILE_BYTES" ] \
-        || { skipped_count=$((skipped_count + 1)); continue; }
-      per_module_files=$((per_module_files + 1))
-      scanned_files=$((scanned_files + 1))
-      if grep -Eiq 'credential_service(_primary)?|autofill_service' "$file" \
-        && grep -Eiq '(^|[^a-z])(settings|cmd[[:space:]]+settings)[[:space:]]+(put|delete|reset)' "$file"; then
-        writer=1
-      fi
-      if grep -Fiq 'com.google.android.gms' "$file" \
-        && grep -Eiq 'freeze|unfreeze|disable|enable|suspend|unsuspend|denylist|detach|pm[[:space:]]' "$file"; then
-        gms=1
-      fi
-      if grep -Eiq 'hyperpasskey|lsposed|xposed|zygisk|system_server|(^|[^a-z])kpm([^a-z]|$)' "$file" \
-        && grep -Eiq 'credential|passkey|credman|fido' "$file"; then
-        hook=1
-      fi
-      case "$file" in
-        */system/framework/*|*/system/system_ext/*|*/system/product/*|*/system/vendor/*) framework=1 ;;
-      esac
-      if grep -Eiq 'config_oemCredentialManagerDialogComponent|config_defaultCredentialManagerHybridService|CredentialManagerService' "$file"; then
-        framework=1
-      fi
-      [ "$scanned_files" -lt "$CONFLICT_MAX_FILES" ] || { status=limit_reached; break; }
-      now=$(epoch_seconds)
-      if [ "$started" -gt 0 ] 2>/dev/null && [ "$now" -gt 0 ] 2>/dev/null \
-        && [ $((now - started)) -ge "$CONFLICT_TOTAL_SECONDS" ]; then
-        status=timeout
-        break
-      fi
-    done < "$file_list"
-    if [ "$writer" -eq 1 ]; then
-      writer_count=$((writer_count + 1))
-      writer_ids=$(append_private_id "$writer_ids" "$module_id")
-    fi
-    if [ "$gms" -eq 1 ]; then
-      gms_count=$((gms_count + 1))
-      gms_ids=$(append_private_id "$gms_ids" "$module_id")
-    fi
-    if [ "$hook" -eq 1 ]; then
-      hook_count=$((hook_count + 1))
-      hook_ids=$(append_private_id "$hook_ids" "$module_id")
-    fi
-    if [ "$framework" -eq 1 ]; then
-      framework_count=$((framework_count + 1))
-      framework_ids=$(append_private_id "$framework_ids" "$module_id")
-    fi
-    case "$status" in timeout|limit_reached) break ;; esac
-  done < "$module_list"
-
-  temporary_file="$CONFLICT_FILE.tmp.$$"
-  {
-    echo "scan_status=$status"
-    echo "settings_writers=$writer_count"
-    echo "gms_managers=$gms_count"
-    echo "deep_hooks=$hook_count"
-    echo "framework_overlays=$framework_count"
-    echo "modules_scanned=$scanned_modules"
-    echo "files_scanned=$scanned_files"
-    echo "entries_skipped=$skipped_count"
-    echo "scanned_at=$(epoch_seconds)"
-  } > "$temporary_file" 2>/dev/null && mv "$temporary_file" "$CONFLICT_FILE" 2>/dev/null
-  secure_state_file "$CONFLICT_FILE"
-  rm -f "$module_list" "$file_list" 2>/dev/null || true
-
-  cat "$CONFLICT_FILE" 2>/dev/null
-  if [ "$report_mode" = private ]; then
-    echo "settings_writer_ids=${writer_ids:-none}"
-    echo "gms_manager_ids=${gms_ids:-none}"
-    echo "deep_hook_ids=${hook_ids:-none}"
-    echo "framework_overlay_ids=${framework_ids:-none}"
-  fi
+  printf 'scanned_at=%s\nboot_id=%s\nmodules_identity=%s\n' \
+    "$(epoch_seconds)" "$(current_boot_id)" "$(modules_identity)" >> "$work/summary"
+  # Each reader receives its own scan, independent of a concurrent report.
+  sed '/^boot_id=/d; /^modules_identity=/d' "$work/summary"
+  if [ "$report_mode" = private ] && [ -f "$work/private" ]; then cat "$work/private"; fi
+  mv "$work/summary" "$CONFLICT_FILE"
+  rm -rf "$work"
+  return "$rc"
 }
 
 modules_identity() {
@@ -553,18 +522,12 @@ modules_identity() {
 }
 
 list_users() {
-  local users
-  users=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" cmd user list 2>/dev/null \
-    | sed -n 's/.*UserInfo{\([0-9][0-9]*\):.*/\1/p' | sort -n | uniq)
-  if [ -z "$users" ]; then
-    echo 0
-  else
-    echo "$users"
-  fi
-}
-
-users_identity() {
-  list_users | tr '\n' ',' | sed 's/,$//'
+  local out users
+  out=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" cmd user list 2>/dev/null) || return 1
+  output_has_transaction_error "$out" && return 1
+  users=$(printf '%s\n' "$out" | sed -n 's/.*UserInfo{\([0-9][0-9]*\):.*/\1/p' | sort -nu)
+  [ -n "$users" ] || return 1
+  printf '%s\n' "$users"
 }
 
 platform_identity() {
@@ -575,23 +538,13 @@ platform_identity() {
 }
 
 gms_version_identity() {
-  local user="${1:-0}" out version path checksum
+  local user="${1:-0}" out
   out=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" cmd package list packages \
-    --show-versioncode --user "$user" "$GMS_PKG" 2>/dev/null || true)
-  version=$(printf '%s\n' "$out" | sed -n \
-    's/.*versionCode[:=][[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
-  if [ -n "$version" ]; then
-    echo "versionCode:$version"
-    return
-  fi
-  path=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" pm path --user "$user" "$GMS_PKG" 2>/dev/null \
-    | head -n 1)
-  if [ -n "$path" ]; then
-    checksum=$(printf '%s' "$path" | cksum 2>/dev/null | awk '{ print $1 ":" $2 }')
-    [ -n "$checksum" ] && echo "pathCksum:$checksum" || echo path:present
-  else
-    echo unavailable
-  fi
+    --show-versioncode --user "$user" "$GMS_PKG" 2>/dev/null) || return 1
+  output_has_transaction_error "$out" && return 1
+  printf '%s\n' "$out" | awk '/^package:com[.]google[.]android[.]gms[[:space:]]/ {
+    for (i=2;i<=NF;i++) if ($i ~ /^versionCode[:=][0-9]+$/) { print $i; found=1; exit }
+  } END { if (!found) exit 1 }'
 }
 
 settings_get_once() {
@@ -604,145 +557,115 @@ settings_get_once() {
 
 set_quick_check_result() {
   local result="$1" reason="$2" temporary_file
-  temporary_file="$QUICK_CHECK_FILE.tmp.$$"
-  {
-    echo "result=$result"
-    echo "reason=$reason"
-    echo "checked_at=$(epoch_seconds)"
-  } > "$temporary_file" 2>/dev/null && mv "$temporary_file" "$QUICK_CHECK_FILE" 2>/dev/null || true
-  secure_state_file "$QUICK_CHECK_FILE"
+  [ "$(plan_value "$QUICK_CHECK_FILE" result)" != "$result" ] \
+    || [ "$(plan_value "$QUICK_CHECK_FILE" reason)" != "$reason" ] || return 0
+  temporary_file=$(mktemp "$STATE_DIR/quick.XXXXXX") || return 1
+  printf 'result=%s\nreason=%s\n' "$result" "$reason" > "$temporary_file"
+  mv "$temporary_file" "$QUICK_CHECK_FILE"
 }
 
 quick_check_reason() {
   plan_value "$QUICK_CHECK_FILE" reason 2>/dev/null || echo unavailable
 }
 
-save_route_fingerprint() {
-  local mode="$1" users first_user temporary_file user key value
-  users=$(users_identity)
-  first_user=${users%%,*}
-  [ -n "$first_user" ] || first_user=0
-  temporary_file="$FINGERPRINT_FILE.tmp.$$"
-  {
-    echo "schema=1"
-    echo "mode=$mode"
-    echo "platform=$(platform_identity)"
-    echo "users=$users"
-    echo "gms=$(gms_version_identity "$first_user")"
-    echo "modules=$(modules_identity)"
-    echo "saved_at=$(epoch_seconds)"
-    for user in $(printf '%s\n' "$users" | tr ',' ' '); do
-      for key in credential_service credential_service_primary autofill_service; do
-        value=$(settings_get_once "$user" "$key" 2>/dev/null || echo '<unreadable>')
-        value=$(printf '%s' "$value" | tr '\r\n' '__')
-        echo "user_${user}_${key}=$value"
+fingerprint_snapshot() {
+  local mode="$1" user users key value version
+  users=$(list_users) || return 1
+  printf 'schema=2\nmode=%s\nplatform=%s\n' "$mode" "$(platform_identity)"
+  echo "config=$(cksum "$MODDIR/module.prop" "$PROFILE_FILE" "$CONF_DIR/policy.conf" 2>/dev/null | awk '{print $1, $2}' | cksum)"
+  echo "users=$(printf '%s' "$users" | tr '\n' ',')"
+  echo "modules=$(modules_identity)"
+  for user in $users; do
+    [ "$(user_state "$user")" = unlocked ] || return 1
+    version=$(gms_version_identity "$user") || return 1
+    gms_package_disabled "$user" && return 1
+    echo "gms_$user=$version"
+    for key in credential_service credential_service_primary autofill_service; do
+      value=$(settings_get_once "$user" "$key") || return 1
+      case "$value" in *'
+'*) return 1 ;; esac
+      echo "user_${user}_$key=$value"
+    done
+  done
+}
+
+# Package replacement invalidates permission evidence via version identity. This
+# targeted action query also detects per-user component disablement without dumps.
+validate_cached_services() {
+  local user users key value component action permission out
+  users=$(list_users) || return 1
+  for user in $users; do
+    for key in credential_service autofill_service; do
+      value=$(plan_value "$FINGERPRINT_FILE" "user_${user}_$key")
+      action=$CREDENTIAL_PROVIDER_ACTION
+      permission=$CREDENTIAL_PROVIDER_PERMISSION
+      if [ "$key" = autofill_service ]; then action=$AUTOFILL_SERVICE_ACTION; permission=$AUTOFILL_SERVICE_PERMISSION; fi
+      for component in $(printf '%s' "$value" | tr ':' ' '); do
+        case "$component" in com.google.android.gms/*) ;; *) continue ;; esac
+        out=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" cmd package query-services \
+          --user "$user" -a "$action" -n "$component" 2>/dev/null) || return 1
+        output_has_transaction_error "$out" && return 1
+        service_permission_in_details "$out" "$component" "$permission" || return 1
       done
     done
-  } > "$temporary_file" 2>/dev/null && mv "$temporary_file" "$FINGERPRINT_FILE" 2>/dev/null \
-    || return 1
-  secure_state_file "$FINGERPRINT_FILE"
-  return 0
+  done
+}
+
+save_route_fingerprint() {
+  local snapshot temporary_file
+  snapshot=$(fingerprint_snapshot "$1") || { rm -f "$FINGERPRINT_FILE"; return 0; }
+  temporary_file=$(mktemp "$STATE_DIR/fingerprint.XXXXXX") || return 1
+  printf '%s\n' "$snapshot" > "$temporary_file"
+  mv "$temporary_file" "$FINGERPRINT_FILE"
 }
 
 quick_route_check() {
-  local mode="$1" expected actual users first_user user state_file key
+  local mode="$1" snapshot user key expected actual
   [ -f "$FINGERPRINT_FILE" ] || { set_quick_check_result changed fingerprint_missing; return 1; }
-  expected=$(plan_value "$FINGERPRINT_FILE" schema)
-  [ "$expected" = 1 ] || { set_quick_check_result changed fingerprint_schema; return 1; }
-  expected=$(plan_value "$FINGERPRINT_FILE" mode)
-  [ "$expected" = "$mode" ] || { set_quick_check_result changed mode_changed; return 1; }
-  expected=$(plan_value "$FINGERPRINT_FILE" platform)
-  actual=$(platform_identity)
-  [ "$expected" = "$actual" ] || { set_quick_check_result changed platform_changed; return 1; }
-  users=$(users_identity)
-  expected=$(plan_value "$FINGERPRINT_FILE" users)
-  [ "$expected" = "$users" ] || { set_quick_check_result changed users_changed; return 1; }
-  first_user=${users%%,*}
-  [ -n "$first_user" ] || first_user=0
-  expected=$(plan_value "$FINGERPRINT_FILE" gms)
-  actual=$(gms_version_identity "$first_user")
-  [ "$expected" = "$actual" ] || { set_quick_check_result changed gms_changed; return 1; }
-  expected=$(plan_value "$FINGERPRINT_FILE" modules)
-  actual=$(modules_identity)
-  [ "$expected" = "$actual" ] || { set_quick_check_result changed modules_changed; return 1; }
-
-  for user in $(printf '%s\n' "$users" | tr ',' ' '); do
-    for key in credential_service credential_service_primary autofill_service; do
-      expected=$(plan_value "$FINGERPRINT_FILE" "user_${user}_${key}")
-      actual=$(settings_get_once "$user" "$key" 2>/dev/null || echo '<unreadable>')
-      [ "$actual" = "$expected" ] \
-        || { set_quick_check_result drift "route_drift:$user:$key"; return 1; }
-    done
-  done
-  set_quick_check_result stable fingerprint_match
-  return 0
-}
-
-settings_get() {
-  local user="$1" key="$2" out rc attempt detail
-  attempt=1
-  while [ "$attempt" -le 3 ]; do
-    out=$(run_with_timeout "$SETTINGS_TIMEOUT_SECONDS" settings get --user "$user" secure "$key" 2>&1)
-    rc=$?
-    if [ "$rc" -eq 0 ] && ! output_has_transaction_error "$out"; then
-      printf '%s\n' "$out" | tr -d '\r'
-      log_event settings_read secure "$user" "$attempt" "$rc" ok "$key"
-      return 0
-    fi
-    detail=$(single_line_detail "$out")
-    log_event settings_read secure "$user" "$attempt" "$rc" failed "$key:$detail"
-    attempt=$((attempt + 1))
-    sleep 1
-  done
+  [ "$(plan_value "$FINGERPRINT_FILE" schema)" = 2 ] \
+    || { set_quick_check_result changed fingerprint_schema; return 1; }
+  snapshot=$(fingerprint_snapshot "$mode") \
+    || { set_quick_check_result changed environment_unreadable_or_unavailable; return 1; }
+  if [ "$snapshot" = "$(cat "$FINGERPRINT_FILE")" ] && validate_cached_services; then
+    set_quick_check_result stable fingerprint_match
+    return 0
+  fi
+  set_quick_check_result changed environment_or_route_changed
   return 1
 }
 
-settings_put() {
-  local user="$1" key="$2" value="$3" out actual rc attempt detail
-  actual=$(settings_get "$user" "$key") || actual="__read_failed__"
-  [ "$actual" = "$value" ] && return 0
-
-  attempt=1
+settings_operation() {
+  local operation="$1" user="$2" key="$3" value="${4:-}" attempt=1 out rc actual
+  if [ "$operation" = put ]; then
+    actual=$(settings_get "$user" "$key") || actual='__read_failed__'
+    [ "$actual" != "$value" ] || return 0
+  fi
   while [ "$attempt" -le 3 ]; do
-    out=$(run_with_timeout "$SETTINGS_TIMEOUT_SECONDS" settings put --user "$user" secure "$key" "$value" 2>&1)
+    if [ "$operation" = put ]; then
+      out=$(run_with_timeout "$SETTINGS_TIMEOUT_SECONDS" settings put --user "$user" secure "$key" "$value" 2>&1)
+    else
+      out=$(run_with_timeout "$SETTINGS_TIMEOUT_SECONDS" settings "$operation" --user "$user" secure "$key" 2>&1)
+    fi
     rc=$?
     if [ "$rc" -eq 0 ] && ! output_has_transaction_error "$out"; then
-      actual=$(settings_get "$user" "$key") || actual="__read_failed__"
-      if [ "$actual" = "$value" ]; then
-        log_event settings_write secure "$user" "$attempt" "$rc" ok "$key"
+      if [ "$operation" = get ]; then printf '%s\n' "$out" | tr -d '\r'; return 0; fi
+      actual=$(settings_get "$user" "$key") || actual='__read_failed__'
+      if { [ "$operation" = put ] && [ "$actual" = "$value" ]; } \
+        || { [ "$operation" = delete ] && { [ -z "$actual" ] || [ "$actual" = null ]; }; }; then
+        log_event "settings_$operation" secure "$user" "$attempt" 0 ok "$key"
         return 0
       fi
     fi
-    detail=$(single_line_detail "$out")
-    log_event settings_write secure "$user" "$attempt" "$rc" failed "$key:$detail"
+    log_event "settings_$operation" secure "$user" "$attempt" "$rc" failed "$key:$(single_line_detail "$out")"
     attempt=$((attempt + 1))
-    sleep 1
+    [ "$attempt" -gt 3 ] || sleep 1
   done
   return 1
 }
 
-settings_delete() {
-  local user="$1" key="$2" out actual rc attempt detail
-  attempt=1
-  while [ "$attempt" -le 3 ]; do
-    out=$(run_with_timeout "$SETTINGS_TIMEOUT_SECONDS" settings delete --user "$user" secure "$key" 2>&1)
-    rc=$?
-    if [ "$rc" -eq 0 ] && ! output_has_transaction_error "$out"; then
-      actual=$(settings_get "$user" "$key") || actual="__read_failed__"
-      case "$actual" in
-        ""|null)
-          log_event settings_delete secure "$user" "$attempt" "$rc" ok "$key"
-          return 0
-          ;;
-      esac
-    fi
-    detail=$(single_line_detail "$out")
-    log_event settings_delete secure "$user" "$attempt" "$rc" failed "$key:$detail"
-    attempt=$((attempt + 1))
-    sleep 1
-  done
-  return 1
-}
+settings_get() { settings_operation get "$@"; }
+settings_put() { settings_operation put "$@"; }
+settings_delete() { settings_operation delete "$@"; }
 
 is_component_name() {
   printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.$-]+$'
@@ -842,7 +765,10 @@ discover_gms_credential_providers() {
   system_details=$(query_service_details "$user" "$SYSTEM_CREDENTIAL_PROVIDER_ACTION" "$GMS_PKG") || system_details=""
   raw=$(printf '%s\n%s\n' "$standard" "$system" | extract_gms_components)
   dump=""
-  if [ "${HYPERGPM_ALLOW_PACKAGE_DUMP:-1}" = 1 ]; then
+  if [ "${HYPERGPM_ALLOW_PACKAGE_DUMP:-1}" = 1 ] && {
+    [ -z "$raw" ] || { [ -n "$standard" ] && [ -z "$standard_details" ]; } \
+      || { [ -n "$system" ] && [ -z "$system_details" ]; }
+  }; then
     dump=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" dumpsys package "$GMS_PKG" 2>/dev/null || true)
   fi
 
@@ -855,7 +781,7 @@ discover_gms_credential_providers() {
   for provider in $raw; do
     if service_permission_in_details "$standard_details" "$provider" "$CREDENTIAL_PROVIDER_PERMISSION" \
       || service_permission_in_details "$system_details" "$provider" "$CREDENTIAL_PROVIDER_PERMISSION" \
-      || service_permission_visible "$dump" "$provider" "$CREDENTIAL_PROVIDER_PERMISSION"; then
+      || dump_declares_service "$dump" "$provider" "$CREDENTIAL_PROVIDER_ACTION" "$CREDENTIAL_PROVIDER_PERMISSION"; then
       echo "$provider"
     else
       log_event provider_validate package "$user" 1 1 invalid_permission "$provider"
@@ -886,38 +812,22 @@ gms_package_disabled() {
     | grep -Fq "package:$GMS_PKG"
 }
 
-service_permission_visible() {
-  local dump="$1" comp="$2" permission="$3" cls
-  cls=${comp#*/}
-  cls=${cls#.}
-  printf '%s\n' "$dump" | grep -Fq "$cls" || return 1
-  printf '%s\n' "$dump" | grep -Fq "$permission"
-}
-
 service_permission_in_details() {
-  local details="$1" comp="$2" permission="$3" cls
+  local details="$1" comp="$2" permission="$3" action="${4:-}" cls
   cls=${comp#*/}
-  case "$cls" in
-    .*) cls="${comp%%/*}${cls}" ;;
-  esac
-  printf '%s\n' "$details" | awk -v cls="$cls" -v permission="$permission" '
-    /^[[:space:]]*(Service|ResolveInfo) #[0-9]+:/ { matched=0 }
-    {
-      compact=$0
-      gsub(/[[:space:]]/, "", compact)
-    }
-    index(compact, "name=" cls) || index(compact, "name:" cls) { matched=1 }
-    matched && (index(compact, "permission=" permission) || index(compact, "permission:" permission)) {
-      valid=1
-    }
-    END { exit(valid ? 0 : 1) }
-  '
+  case "$cls" in .*) cls="${comp%%/*}${cls}" ;; esac
+  printf '%s\n' "$details" | awk -v cls="$cls" -v permission="$permission" -v action="$action" '
+    function finish() { if (matched && permitted && (action == "" || declared)) valid=1 }
+    /^[[:space:]]*(Service|ResolveInfo) #[0-9]+:/ { finish(); matched=0; permitted=0; declared=0 }
+    { compact=$0; gsub(/[[:space:]]/, "", compact)
+      if (compact == "name=" cls || compact == "name:" cls) matched=1
+      if (compact == "permission=" permission || compact == "permission:" permission) permitted=1
+      if (compact == "action=" action || compact == "action:" action) declared=1 }
+    END { finish(); exit(valid ? 0 : 1) }'
 }
 
 dump_declares_service() {
-  local dump="$1" comp="$2" action="$3" permission="$4"
-  service_permission_visible "$dump" "$comp" "$permission" || return 1
-  printf '%s\n' "$dump" | grep -Fq "$action"
+  service_permission_in_details "$1" "$2" "$4" "$3"
 }
 
 provider_query_state() {
@@ -949,12 +859,16 @@ discover_gms_autofill_services() {
     | extract_gms_components || true)
   details=$(query_service_details "$user" "$AUTOFILL_SERVICE_ACTION" "$GMS_PKG" 2>/dev/null || true)
   dump=""
-  if [ "${HYPERGPM_ALLOW_PACKAGE_DUMP:-1}" = 1 ]; then
+  if [ "${HYPERGPM_ALLOW_PACKAGE_DUMP:-1}" = 1 ] && { [ -z "$raw" ] || [ -z "$details" ]; }; then
     dump=$(run_with_timeout "$QUERY_TIMEOUT_SECONDS" dumpsys package "$GMS_PKG" 2>/dev/null || true)
+  fi
+  if [ -z "$raw" ] && dump_declares_service "$dump" "$GMS_AUTOFILL_COMPONENT" \
+    "$AUTOFILL_SERVICE_ACTION" "$AUTOFILL_SERVICE_PERMISSION"; then
+    raw=$GMS_AUTOFILL_COMPONENT
   fi
   for provider in $raw; do
     if service_permission_in_details "$details" "$provider" "$AUTOFILL_SERVICE_PERMISSION" \
-      || service_permission_visible "$dump" "$provider" "$AUTOFILL_SERVICE_PERMISSION"; then
+      || dump_declares_service "$dump" "$provider" "$AUTOFILL_SERVICE_ACTION" "$AUTOFILL_SERVICE_PERMISSION"; then
       echo "$provider"
     else
       log_event autofill_validate package "$user" 1 1 invalid_permission "$provider"
@@ -1011,21 +925,30 @@ choose_gms_provider_list() {
 
 backup_settings_once() {
   local user="$1" credential_value="$2" primary_value="$3" autofill_value="$4"
-  local backup_file="$BACKUP_DIR/user_${user}.secure" temporary_file
-  [ -f "$backup_file" ] && return 0
-  temporary_file="$backup_file.tmp.$$"
-  {
-    echo "credential_service=$credential_value"
-    echo "credential_service_primary=$primary_value"
-    echo "autofill_service=$autofill_value"
-  } > "$temporary_file" 2>/dev/null || return 1
-  mv "$temporary_file" "$backup_file" 2>/dev/null || return 1
-  secure_state_file "$backup_file"
+  local plan="${5:-}" file="$BACKUP_DIR/user_${user}.secure" tmp key value state
+  tmp=$(mktemp "$BACKUP_DIR/backup.XXXXXX") || return 1
+  if [ -f "$file" ]; then cat "$file" > "$tmp"; else echo schema=2 > "$tmp"; fi
+  for key in credential_service credential_service_primary autofill_service; do
+    if [ -f "$file" ] && { [ "$(plan_value "$file" schema)" != 2 ] \
+      || [ "$(plan_value "$file" "${key}_backed_up")" = 1 ]; }; then continue; fi
+    [ -z "$plan" ] || [ "$(plan_value "$plan" "${key}_state")" != unsupported ] || continue
+    case "$key" in
+      credential_service) value=$credential_value ;;
+      credential_service_primary) value=$primary_value ;;
+      autofill_service) value=$autofill_value ;;
+    esac
+    printf '%s=%s\n%s_backed_up=1\n' "$key" "$value" "$key" >> "$tmp"
+  done
+  mv "$tmp" "$file"
 }
 
 plan_value() {
-  local plan_file="$1" key="$2"
-  sed -n "s/^${key}=//p" "$plan_file" | head -n 1
+  local file="$1" key="$2" line
+  [ -f "$file" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in "$key="*) printf '%s\n' "${line#*=}"; return 0 ;; esac
+  done < "$file"
+  return 1
 }
 
 write_plan_value() {
@@ -1036,6 +959,13 @@ write_plan_value() {
 
 is_oem_provider() {
   printf '%s\n' "$1" | grep -Eiq 'xiaomi|miui|com\.fido\.asm|mipass'
+}
+
+write_failure_class() {
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/failure.XXXXXX") || return 1
+  printf '%s\n' "$1" > "$tmp"
+  mv "$tmp" "$STATE_DIR/last-failure-class"
 }
 
 stored_failure_class() {
@@ -1083,7 +1013,7 @@ plan_google_route_for_user() {
   autofill_key_state=present
   autofill_reason=credential_and_autofill_are_independent
 
-  if [ "$state" = "locked" ]; then
+  if [ "$state" != "unlocked" ]; then
     action=skip
     reason=user_locked
   elif [ "$mode" = "observe-only" ]; then
@@ -1103,7 +1033,7 @@ plan_google_route_for_user() {
     fi
   fi
 
-  if [ "$state" = "locked" ]; then
+  if [ "$state" != "unlocked" ]; then
     write_plan_value "$plan_file" user "$user"
     write_plan_value "$plan_file" mode "$mode"
     write_plan_value "$plan_file" user_state "$state"
@@ -1279,7 +1209,7 @@ show_route_plan() {
   [ "$mode" != "invalid" ] || { echo "invalid mode: $explicit" >&2; return 1; }
   rc=0
   for user in $(list_users); do
-    plan_file=$(mktemp "$DATA_DIR/plan.XXXXXX" 2>/dev/null) || return 1
+    plan_file=$(mktemp "${HYPERGPM_TIMEOUT_DIR:-$DATA_DIR}/plan.XXXXXX" 2>/dev/null) || return 1
     if plan_google_route_for_user "$user" "$mode" "$plan_file"; then
       print_route_plan_file "$plan_file"
     else
@@ -1287,24 +1217,6 @@ show_route_plan() {
     fi
     rm -f "$plan_file" 2>/dev/null || true
   done
-  return "$rc"
-}
-
-restore_user_values() {
-  local user="$1" credential_value="$2" primary_value="$3" autofill_value="$4" rc
-  rc=0
-  case "$credential_value" in
-    ""|null) settings_delete "$user" credential_service || rc=1 ;;
-    *) settings_put "$user" credential_service "$credential_value" || rc=1 ;;
-  esac
-  case "$primary_value" in
-    ""|null) settings_delete "$user" credential_service_primary || rc=1 ;;
-    *) settings_put "$user" credential_service_primary "$primary_value" || rc=1 ;;
-  esac
-  case "$autofill_value" in
-    ""|null) settings_delete "$user" autofill_service || rc=1 ;;
-    *) settings_put "$user" autofill_service "$autofill_value" || rc=1 ;;
-  esac
   return "$rc"
 }
 
@@ -1328,12 +1240,13 @@ record_route_ownership() {
     echo "credential_service_primary=$primary"
     echo "autofill_managed=$autofill_managed"
     echo "autofill_service=$autofill"
+    echo "transaction_id=$(plan_value "$STATE_DIR/user_${user}.txn" transaction_id 2>/dev/null || true)"
     echo "applied_at=$(epoch_seconds)"
     echo "reason=$(sanitize_event_value "$reason")"
   } > "$temporary_file" 2>/dev/null || return 1
   mv "$temporary_file" "$state_file" 2>/dev/null || return 1
   secure_state_file "$state_file"
-  printf '%s\n' none > "$STATE_DIR/last-failure-class" 2>/dev/null || true
+  write_failure_class none 2>/dev/null || true
   rm -f "$STATE_DIR/ownership-conflict" 2>/dev/null || true
   return 0
 }
@@ -1354,17 +1267,38 @@ ownership_key_managed() {
 }
 
 restore_settings() {
-  local restore_mode="${1:-safe}" user backup_file state_file key original last current user_rc rc
+  local mode="${1:-safe}" rc
+  case "$mode" in safe|force) ;; *) return 2 ;; esac
+  acquire_apply_lock restore || return 1
+  if recover_transactions; then
+    # Persist intent before touching settings so interrupted restore does not
+    # let automatic boot reclaim the route. An explicit apply resumes it.
+    : > "$STATE_DIR/restore-paused"
+    restore_settings_locked "$mode"
+    rc=$?
+  else
+    rc=1
+  fi
+  release_apply_lock
+  return "$rc"
+}
+
+restore_settings_locked() {
+  local restore_mode="${1:-safe}" user backup_file state_file key original last current user_rc rc users
   case "$restore_mode" in safe|force) ;; *) return 2 ;; esac
   rc=0
-  for user in $(list_users); do
+  users=$(list_users) || return 1
+  for user in $users; do
+    [ "$(user_state "$user")" = unlocked ] || { rc=1; continue; }
     backup_file="$BACKUP_DIR/user_${user}.secure"
     state_file="$STATE_DIR/user_${user}.last"
     [ -f "$backup_file" ] && [ -f "$state_file" ] || continue
     user_rc=0
     for key in credential_service credential_service_primary autofill_service; do
       ownership_key_managed "$state_file" "$key" || continue
-      original=$(plan_value "$backup_file" "$key")
+      if [ "$(plan_value "$backup_file" schema)" = 2 ] \
+        && [ "$(plan_value "$backup_file" "${key}_backed_up")" != 1 ]; then continue; fi
+      original=$(plan_value "$backup_file" "$key") || { user_rc=1; continue; }
       last=$(plan_value "$state_file" "$key")
       current=$(settings_get "$user" "$key") || { user_rc=1; continue; }
       if [ "$current" != "$last" ]; then
@@ -1390,221 +1324,273 @@ restore_settings() {
   return "$rc"
 }
 
+current_pid() {
+  local line
+  if [ -r /proc/self/stat ]; then
+    IFS= read -r line < /proc/self/stat
+    HYPERGPM_CURRENT_PID=${line%% *}
+  else
+    local pid_file
+    pid_file=$(mktemp "$DATA_DIR/pid.XXXXXX") || return 1
+    sh -c 'echo "$PPID"' > "$pid_file"
+    IFS= read -r HYPERGPM_CURRENT_PID < "$pid_file"
+    rm -f "$pid_file"
+  fi
+}
+
+process_identity() {
+  local line
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  if [ -r "/proc/$1/stat" ]; then
+    IFS= read -r line < "/proc/$1/stat" || return 1
+    line=${line##*) }
+    printf '%s\n' "$line" | awk '{ print $20 }'
+  else
+    ps -p "$1" -o lstart= 2>/dev/null
+  fi
+}
+
 acquire_apply_lock() {
-  local owner_type="${1:-${HYPERGPM_LOCK_OWNER:-manual}}" max_wait="${2:-${HYPERGPM_LOCK_WAIT_SECONDS:-5}}"
-  local attempt owner existing_type started waited
+  local owner_type="${1:-manual}" max_wait="${2:-${HYPERGPM_LOCK_WAIT_SECONDS:-5}}"
+  local attempt=0 owner identity recorded token pid claim live
   case "$max_wait" in ''|*[!0-9]*) max_wait=5 ;; esac
-  attempt=1
-  started=$(epoch_seconds)
-  while [ "$attempt" -le $((max_wait + 1)) ]; do
+  [ "$max_wait" -le 30 ] || max_wait=30
+  current_pid || return 1
+  pid=$HYPERGPM_CURRENT_PID
+  token=$(mktemp "$DATA_DIR/lock-claim.$pid.XXXXXX") || return 1
+  process_identity "$pid" > "$token"
+  while [ "$attempt" -le "$max_wait" ]; do
     if mkdir "$APPLY_LOCK_DIR" 2>/dev/null; then
-      echo "$$" > "$APPLY_LOCK_DIR/pid" 2>/dev/null || true
-      echo "$(sanitize_event_value "$owner_type")" > "$APPLY_LOCK_DIR/type" 2>/dev/null || true
-      echo "$started" > "$APPLY_LOCK_DIR/started_at" 2>/dev/null || true
+      ln "$token" "$APPLY_LOCK_DIR/owner" || { rm -f "$token"; rmdir "$APPLY_LOCK_DIR"; return 1; }
+      printf '%s\n' "$pid" > "$APPLY_LOCK_DIR/pid"
+      process_identity "$pid" > "$APPLY_LOCK_DIR/identity"
+      printf '%s\n' "$owner_type" > "$APPLY_LOCK_DIR/type"
+      HYPERGPM_LOCK_TOKEN=$token
       return 0
     fi
     owner=$(cat "$APPLY_LOCK_DIR/pid" 2>/dev/null)
-    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-      rm -rf "$APPLY_LOCK_DIR" 2>/dev/null || true
-      continue
+    recorded=$(cat "$APPLY_LOCK_DIR/identity" 2>/dev/null)
+    identity=$(process_identity "$owner")
+    # Claims exist before mkdir. A live initializing owner prevents reaping;
+    # after a crash, an empty directory can be reclaimed without guessing age.
+    if [ -z "$owner" ]; then
+      live=0
+      for claim in "$DATA_DIR"/lock-claim.*; do
+        [ -f "$claim" ] && [ "$claim" != "$token" ] || continue
+        owner=${claim##*/lock-claim.}; owner=${owner%%.*}
+        if kill -0 "$owner" 2>/dev/null && [ "$(cat "$claim")" = "$(process_identity "$owner")" ]; then
+          live=1
+        else rm -f "$claim"; fi
+      done
+      owner=''
+      if [ "$live" -eq 0 ] && mkdir "$APPLY_LOCK_DIR/reaper" 2>/dev/null; then
+        if [ -s "$APPLY_LOCK_DIR/pid" ]; then
+          rmdir "$APPLY_LOCK_DIR/reaper" 2>/dev/null || true
+        else rm -rf "$APPLY_LOCK_DIR"; fi
+      fi
     fi
-    if [ -z "$owner" ] && [ "$attempt" -gt 1 ]; then
-      rm -rf "$APPLY_LOCK_DIR" 2>/dev/null || true
-      continue
+    if [ -n "$owner" ] && { ! kill -0 "$owner" 2>/dev/null \
+      || { [ -n "$recorded" ] && [ -n "$identity" ] && [ "$recorded" != "$identity" ]; }; }; then
+      # One reaper owns this directory until it is removed. Never reap an
+      # uninitialized lock: its creator could still be writing the owner record.
+      if mkdir "$APPLY_LOCK_DIR/reaper" 2>/dev/null; then
+        if [ "$(cat "$APPLY_LOCK_DIR/pid" 2>/dev/null)" = "$owner" ]; then
+          for claim in "$DATA_DIR"/lock-claim."$owner".*; do
+            [ ! "$claim" -ef "$APPLY_LOCK_DIR/owner" ] || rm -f "$claim"
+          done
+          rm -rf "$APPLY_LOCK_DIR"
+        else
+          rmdir "$APPLY_LOCK_DIR/reaper" 2>/dev/null || true
+        fi
+      fi
     fi
     attempt=$((attempt + 1))
-    [ "$attempt" -le $((max_wait + 1)) ] || break
-    sleep 1
+    [ "$attempt" -gt "$max_wait" ] || sleep 1
   done
-  existing_type=$(cat "$APPLY_LOCK_DIR/type" 2>/dev/null)
-  waited=$(epoch_seconds)
-  if [ "$started" -gt 0 ] 2>/dev/null && [ "$waited" -ge "$started" ] 2>/dev/null; then
-    waited=$((waited - started))
-  else
-    waited=$max_wait
-  fi
-  log "apply lock busy; owner_type=${existing_type:-unknown} waited=${waited}s"
-  [ "${HYPERGPM_EXPLAIN:-0}" = 1 ] \
-    && echo "apply lock busy: owner=${existing_type:-unknown}, waited=${waited}s" >&2
+  rm -f "$token"
+  log_event lock lifecycle all "$attempt" 1 busy "$owner_type"
   return 1
 }
 
 release_apply_lock() {
-  rm -rf "$APPLY_LOCK_DIR" 2>/dev/null || true
+  if [ -n "${HYPERGPM_LOCK_TOKEN:-}" ] && [ "$HYPERGPM_LOCK_TOKEN" -ef "$APPLY_LOCK_DIR/owner" ]; then
+    rm -rf "$APPLY_LOCK_DIR"
+    rm -f "$HYPERGPM_LOCK_TOKEN"
+  fi
+  HYPERGPM_LOCK_TOKEN=''
 }
 
-apply_google_route_for_user() {
-  local user="$1" mode="$2" plan_file action current current_primary current_autofill
-  local target target_primary credential_action primary_action autofill_action target_autofill
-  local changed_credential changed_primary changed_autofill partial_rc
-
-  plan_file=$(mktemp "$DATA_DIR/plan.XXXXXX" 2>/dev/null) || return 1
-  plan_google_route_for_user "$user" "$mode" "$plan_file" || {
-    rm -f "$plan_file" 2>/dev/null || true
-    return 1
-  }
-  [ "${HYPERGPM_EXPLAIN:-0}" = "1" ] && print_route_plan_file "$plan_file" >&2
-  action=$(plan_value "$plan_file" action)
-  case "$action" in
-    observe|skip)
-      log_event route_plan secure "$user" 1 0 "$action" "$(plan_value "$plan_file" reason)"
-      rm -f "$plan_file" 2>/dev/null || true
-      return 2
-      ;;
-    blocked)
-      log_event route_plan secure "$user" 1 1 blocked "$(plan_value "$plan_file" reason)"
-      printf '%s\n' "$(plan_value "$plan_file" reason)" > "$STATE_DIR/last-apply-class" 2>/dev/null || true
-      rm -f "$plan_file" 2>/dev/null || true
-      return 1
-      ;;
-  esac
-
-  current=$(plan_value "$plan_file" current_credential_service)
-  current_primary=$(plan_value "$plan_file" current_credential_service_primary)
-  current_autofill=$(plan_value "$plan_file" current_autofill_service)
-  target=$(plan_value "$plan_file" target_credential_service)
-  target_primary=$(plan_value "$plan_file" target_credential_service_primary)
-  credential_action=$(plan_value "$plan_file" credential_service_action)
-  primary_action=$(plan_value "$plan_file" credential_service_primary_action)
-  autofill_action=$(plan_value "$plan_file" autofill_action)
-  target_autofill=$(plan_value "$plan_file" gms_autofill_provider)
-  changed_credential=0
-  changed_primary=0
-  changed_autofill=0
-  partial_rc=0
-
-  if { [ "$credential_action" != set ] || [ "$current" = "$target" ]; } \
-    && { [ "$primary_action" != set ] || [ "$current_primary" = "$target_primary" ]; } \
-    && { [ "$autofill_action" != "set" ] || [ "$current_autofill" = "$target_autofill" ]; }; then
-    log_event route_apply secure "$user" 1 0 no_changes already_matches_plan
-    rm -f "$plan_file" 2>/dev/null || true
+recover_user_transaction() {
+  local user="$1" journal="$STATE_DIR/user_${1}.txn" key before target actual rc=0
+  [ -f "$journal" ] || return 0
+  local transaction_id
+  transaction_id=$(plan_value "$journal" transaction_id)
+  if [ -n "$transaction_id" ] && [ "$transaction_id" = "$(plan_value "$STATE_DIR/user_${user}.last" transaction_id)" ]; then
+    rm -f "$journal"
     return 0
   fi
-
-  backup_settings_once "$user" "$current" "$current_primary" "$current_autofill" || {
-    log_event route_apply backup "$user" 1 1 failed backup_write
-    rm -f "$plan_file" 2>/dev/null || true
-    return 1
-  }
-
-  if [ "$credential_action" = set ] && [ "$current" != "$target" ]; then
-    if settings_put "$user" credential_service "$target"; then
-      changed_credential=1
-    else
-      restore_key_value "$user" credential_service "$current" || true
-      if [ "$mode" = force ]; then
-        credential_action=unsupported
-        partial_rc=1
-        log_event route_apply secure "$user" 1 1 unsupported_setting credential_service
-      else
-        rm -f "$plan_file" 2>/dev/null || true
-        printf '%s\n' settings_binder_transient > "$STATE_DIR/last-apply-class" 2>/dev/null || true
-        return 1
-      fi
+  [ "$(user_state "$user")" = unlocked ] || return 1
+  for key in autofill_service credential_service_primary credential_service; do
+    before=$(plan_value "$journal" "${key}_before") || continue
+    target=$(plan_value "$journal" "${key}_target") || { rc=1; continue; }
+    actual=$(settings_get "$user" "$key") || { rc=1; continue; }
+    if [ "$actual" = "$target" ]; then
+      restore_key_value "$user" "$key" "$before" || rc=1
     fi
-  fi
-  if [ "$primary_action" = set ] && [ "$current_primary" != "$target_primary" ]; then
-    if settings_put "$user" credential_service_primary "$target_primary"; then
-      changed_primary=1
-    else
-      restore_key_value "$user" credential_service_primary "$current_primary" || true
-      if [ "$mode" = force ]; then
-        primary_action=unsupported
-        partial_rc=1
-        log_event route_apply secure "$user" 1 1 unsupported_setting credential_service_primary
-      else
-        [ "$changed_credential" -eq 1 ] && restore_key_value "$user" credential_service "$current" || true
-        rm -f "$plan_file" 2>/dev/null || true
-        printf '%s\n' settings_binder_transient > "$STATE_DIR/last-apply-class" 2>/dev/null || true
-        return 1
-      fi
-    fi
-  fi
-  if [ "$autofill_action" = "set" ] && [ "$current_autofill" != "$target_autofill" ]; then
-    if settings_put "$user" autofill_service "$target_autofill"; then
-      changed_autofill=1
-    else
-      restore_key_value "$user" autofill_service "$current_autofill" || true
-      autofill_action=unsupported
-      partial_rc=1
-      log_event route_apply secure "$user" 1 1 unsupported_setting autofill_service
-    fi
-  fi
-
-  if ! record_route_ownership "$user" \
-    "$([ "$credential_action" = set ] && echo 1 || echo 0)" "$target" \
-    "$([ "$primary_action" = set ] && echo 1 || echo 0)" "$target_primary" \
-    "$([ "$autofill_action" = set ] && echo 1 || echo 0)" "$target_autofill" "$mode"; then
-    [ "$changed_autofill" -eq 1 ] && restore_key_value "$user" autofill_service "$current_autofill" || true
-    [ "$changed_primary" -eq 1 ] && restore_key_value "$user" credential_service_primary "$current_primary" || true
-    [ "$changed_credential" -eq 1 ] && restore_key_value "$user" credential_service "$current" || true
-    rm -f "$plan_file" 2>/dev/null || true
-    return 1
-  fi
-
-  if [ "$partial_rc" -eq 0 ]; then
-    printf '%s\n' none > "$STATE_DIR/last-apply-class" 2>/dev/null || true
-    log_event route_apply secure "$user" 1 0 ok "writes=$((changed_credential + changed_primary + changed_autofill))"
-  else
-    log_event route_apply secure "$user" 1 1 partial "writes=$((changed_credential + changed_primary + changed_autofill))"
-  fi
-  rm -f "$plan_file" 2>/dev/null || true
-  return "$partial_rc"
+  done
+  [ "$rc" -ne 0 ] || rm -f "$journal"
+  return "$rc"
 }
 
-apply_google_route_locked() {
-  local mode="$1" user result rc
-  rc=0
-  for user in $(list_users); do
-    apply_google_route_for_user "$user" "$mode"
-    result=$?
-    [ "$result" -eq 1 ] && rc=1
+recover_transactions() {
+  local file user rc=0
+  for file in "$STATE_DIR"/user_*.txn; do
+    [ -f "$file" ] || continue
+    user=${file##*/user_}; user=${user%.txn}
+    case "$user" in ''|*[!0-9]*) return 1 ;; esac
+    recover_user_transaction "$user" || rc=1
   done
   return "$rc"
 }
 
+journal_key() {
+  local user="$1" key="$2" before="$3" target="$4" tmp file="$STATE_DIR/user_${1}.txn"
+  tmp=$(mktemp "$STATE_DIR/journal.XXXXXX") || return 1
+  if [ -f "$file" ]; then cat "$file" > "$tmp"
+  else printf 'transaction_id=%s\n' "${tmp##*/}" > "$tmp"; fi
+  printf '%s_before=%s\n%s_target=%s\n' "$key" "$before" "$key" "$target" >> "$tmp"
+  mv "$tmp" "$file"
+}
+
+apply_google_route_for_user() {
+  local user="$1" mode="$2" plan action key before target rc=0 managed tmp old actual
+  local credential_managed=0 primary_managed=0 autofill_managed=0 credential='' primary='' autofill='' completed=0
+  plan=$(mktemp "${HYPERGPM_TIMEOUT_DIR:-$DATA_DIR}/plan.XXXXXX") || return 1
+  plan_google_route_for_user "$user" "$mode" "$plan" || { rm -f "$plan"; return 1; }
+  [ "${HYPERGPM_EXPLAIN:-0}" != 1 ] || print_route_plan_file "$plan" >&2
+  action=$(plan_value "$plan" action)
+  if [ "$action" != apply ]; then
+    log_event route_plan secure "$user" 1 0 "$action" "$(plan_value "$plan" reason)"
+    printf '%s\n' "$(plan_value "$plan" reason)" > "$STATE_DIR/last-apply-class"
+    rm -f "$plan"
+    [ "$action" != blocked ] || return 1
+    return 2
+  fi
+  backup_settings_once "$user" "$(plan_value "$plan" current_credential_service)" \
+    "$(plan_value "$plan" current_credential_service_primary)" \
+    "$(plan_value "$plan" current_autofill_service)" "$plan" || { rm -f "$plan"; return 1; }
+  old="$STATE_DIR/user_${user}.last"
+  for key in credential_service credential_service_primary autofill_service; do
+    action=$(plan_value "$plan" "${key}_action")
+    before=$(plan_value "$plan" "current_$key")
+    target=$(plan_value "$plan" "target_$key")
+    if [ "$key" = autofill_service ]; then
+      action=$(plan_value "$plan" autofill_action)
+      target=$(plan_value "$plan" gms_autofill_provider)
+    fi
+    managed=0
+    if [ -f "$old" ] && ownership_key_managed "$old" "$key" \
+      && [ "$before" = "$(plan_value "$old" "$key")" ]; then managed=1; fi
+    if [ "$action" = set ] && [ "$before" != "$target" ]; then
+      if ! journal_key "$user" "$key" "$before" "$target"; then rc=1; break; fi
+      if settings_put "$user" "$key" "$target"; then
+        before=$target
+        managed=1
+      else
+        rc=1
+        # Roll back this key first. Keep the journal on failure for next entry.
+        actual=$(settings_get "$user" "$key") || break
+        if [ "$actual" = "$target" ]; then
+          restore_key_value "$user" "$key" "$before" || break
+        elif [ "$actual" != "$before" ]; then
+          before=$actual
+          managed=0
+        fi
+        if [ "$key" != autofill_service ] && [ "$mode" != force ]; then break; fi
+        # The failed key was restored; remove its intent, preserving earlier keys.
+        tmp=$(mktemp "$STATE_DIR/journal.XXXXXX") || break
+        awk -v key="$key" 'index($0,key "_before=") != 1 && index($0,key "_target=") != 1' \
+          "$STATE_DIR/user_${user}.txn" > "$tmp"
+        mv "$tmp" "$STATE_DIR/user_${user}.txn"
+      fi
+    fi
+    case "$key" in
+      credential_service) credential_managed=$managed; credential=$before ;;
+      credential_service_primary) primary_managed=$managed; primary=$before ;;
+      autofill_service) autofill_managed=$managed; autofill=$before ;;
+    esac
+    completed=$((completed + 1))
+  done
+  if [ "$completed" -eq 3 ]; then
+    if record_route_ownership "$user" "$credential_managed" "$credential" \
+      "$primary_managed" "$primary" "$autofill_managed" "$autofill" "$mode"; then
+      rm -f "$STATE_DIR/user_${user}.txn"
+    else rc=1; recover_user_transaction "$user" || true; fi
+  else
+    recover_user_transaction "$user" || true
+    rc=1
+  fi
+  [ "$rc" -eq 0 ] && action=none || action=settings_binder_transient
+  printf '%s\n' "$action" > "$STATE_DIR/last-apply-class"
+  log_event route_apply secure "$user" 1 "$rc" completed "$mode"
+  rm -f "$plan"
+  return "$rc"
+}
+
+apply_google_route_locked() {
+  local mode="$1" user result rc=0 users complete=1
+  users=$(list_users) || return 1
+  for user in $users; do
+    apply_google_route_for_user "$user" "$mode"
+    result=$?
+    [ "$result" -ne 1 ] || rc=1
+    [ "$result" -eq 0 ] || complete=0
+  done
+  if [ "$rc" -eq 0 ] && [ "$complete" -eq 1 ] && [ "$mode" != observe-only ]; then
+    save_route_fingerprint "$mode" || rc=1
+    rm -f "$STATE_DIR/deferred-users"
+  else
+    rm -f "$FINGERPRINT_FILE"
+    if [ "$complete" -eq 0 ] && [ "$mode" != observe-only ]; then : > "$STATE_DIR/deferred-users"; fi
+  fi
+  return "$rc"
+}
+
 apply_google_route_under_lock() {
-  local explicit="$1" mode="$2" rc quick_reason level temporary_file
-  if quick_route_check "$mode"; then
-    log_event route_apply fingerprint all 1 0 stable fingerprint_match
+  local explicit="$1" mode="$2" level now scanned boot previous
+  recover_transactions || return 1
+  if [ -f "$STATE_DIR/restore-paused" ] && [ -z "$explicit" ]; then
+    set_quick_check_result paused restored_by_user
     return 0
   fi
-  quick_reason=$(quick_check_reason)
-  if [ "${HYPERGPM_BOOT_PATH:-0}" = 1 ]; then
-    case "$quick_reason" in
-      route_drift:*)
-        temporary_file="$STATE_DIR/ownership-conflict.tmp.$$"
-        {
-          echo "state=detected"
-          echo "reason=$quick_reason"
-          echo "detected_at=$(epoch_seconds)"
-        } > "$temporary_file" 2>/dev/null \
-          && mv "$temporary_file" "$STATE_DIR/ownership-conflict" 2>/dev/null || true
-        secure_state_file "$STATE_DIR/ownership-conflict"
-        log_event route_apply ownership all 1 0 stopped "$quick_reason"
-        return 0
-        ;;
-    esac
+  # Ownership is checked even when a different dependency invalidated the cache.
+  if [ "${HYPERGPM_BOOT_PATH:-0}" = 1 ] && ! verify_owned_routes; then
+    printf 'state=detected\nreason=owned_route_changed_or_unreadable\n' > "$STATE_DIR/ownership-conflict"
+    set_quick_check_result drift owned_route_changed_or_unreadable
+    return 0
   fi
-
-  if [ "${HYPERGPM_SKIP_CONFLICT_REFRESH:-0}" != 1 ]; then
+  now=$(epoch_seconds)
+  scanned=$(cached_conflict_value scanned_at)
+  boot=$(current_boot_id)
+  previous=$(cached_conflict_value boot_id)
+  case "$scanned" in ''|*[!0-9]*) scanned=0 ;; esac
+  if [ "${HYPERGPM_REFRESH_CONFLICT:-0}" = 1 ] || [ -n "$explicit" ] \
+    || [ "$previous" != "$boot" ] || [ $((now - scanned)) -ge 60 ] \
+    || [ "$(cached_conflict_value modules_identity)" != "$(modules_identity)" ]; then
     scan_module_conflicts public >/dev/null 2>&1 || true
   fi
   level=$(conflict_level)
-  if [ -z "$explicit" ] && [ "$level" = ownership_unclear ]; then
+  if [ -z "$explicit" ] && [ "$level" != none ]; then
     mode=observe-only
-    log_event route_apply conflict all 1 0 downgraded ownership_unclear
-    [ "${HYPERGPM_EXPLAIN:-0}" = 1 ] \
-      && echo "conflict guard: automatic mode downgraded to observe-only" >&2
+    log_event route_apply conflict all 1 0 downgraded "$level"
   fi
-
+  if [ "$mode" != observe-only ] && [ "$level" = none ] && quick_route_check "$mode"; then
+    return 0
+  fi
   apply_google_route_locked "$mode"
-  rc=$?
-  if [ "$rc" -eq 0 ]; then
-    save_route_fingerprint "$mode" || {
-      log_event route_apply fingerprint all 1 1 failed save_failed
-      return 1
-    }
+  local rc=$?
+  if [ "$rc" -eq 0 ] && [ -n "$explicit" ] && [ "$mode" != observe-only ]; then
+    rm -f "$STATE_DIR/restore-paused"
   fi
   return "$rc"
 }
@@ -1657,7 +1643,6 @@ apply_google_route_once_per_boot() {
     case "$class" in
       provider_missing_or_invalid|settings_binder_transient)
         sleep 5
-        HYPERGPM_SKIP_CONFLICT_REFRESH=1
         attempt=2
         apply_google_route_under_lock "" "$mode"
         rc=$?
@@ -1704,9 +1689,10 @@ classify_recent_failure() {
 }
 
 verify_owned_routes() {
-  local user state_file key expected actual rc
+  local user state_file key expected actual rc users
   rc=0
-  for user in $(list_users); do
+  users=$(list_users) || return 1
+  for user in $users; do
     state_file="$STATE_DIR/user_${user}.last"
     [ -f "$state_file" ] || continue
     for key in credential_service credential_service_primary autofill_service; do
@@ -1715,37 +1701,25 @@ verify_owned_routes() {
       actual=$(settings_get "$user" "$key") || { rc=1; continue; }
       if [ "$actual" != "$expected" ]; then
         log_event route_verify secure "$user" 1 1 settings_rewritten_by_oem "$key"
-        printf '%s\n' settings_rewritten_by_oem > "$STATE_DIR/last-failure-class" 2>/dev/null || true
+        write_failure_class settings_rewritten_by_oem 2>/dev/null || true
         rc=1
       fi
     done
   done
   [ "$rc" -ne 0 ] \
-    || printf '%s\n' none > "$STATE_DIR/last-failure-class" 2>/dev/null \
+    || write_failure_class none 2>/dev/null \
     || true
   return "$rc"
 }
 
 verify_owned_routes_once() {
-  local source="${1:-boot}" marker_file="$STATE_DIR/boot-verify" boot_id previous apply_result quick_result rc
+  local source="${1:-boot}" marker_file="$STATE_DIR/boot-verify" boot_id previous rc
   boot_id=$(current_boot_id)
   previous=$(plan_value "$marker_file" boot_id 2>/dev/null || true)
   [ "$boot_id" = unknown ] || [ "$previous" != "$boot_id" ] || return 0
-  apply_result=$(plan_value "$STATE_DIR/boot-apply" result 2>/dev/null || echo unknown)
-  quick_result=$(plan_value "$QUICK_CHECK_FILE" result 2>/dev/null || echo unknown)
-  if [ "$apply_result" = 0 ] || [ "$quick_result" = stable ]; then
-    rc=0
-  else
-    verify_owned_routes
-    rc=$?
-  fi
-  {
-    echo "boot_id=$boot_id"
-    echo "source=$source"
-    echo "result=$rc"
-    echo "finished_at=$(epoch_seconds)"
-  } > "$marker_file.tmp.$$" 2>/dev/null && mv "$marker_file.tmp.$$" "$marker_file" 2>/dev/null || true
-  secure_state_file "$marker_file"
+  verify_owned_routes
+  rc=$?
+  printf 'boot_id=%s\nsource=%s\nresult=%s\n' "$boot_id" "$source" "$rc" > "$marker_file"
   return "$rc"
 }
 
@@ -1753,8 +1727,13 @@ capability_snapshot() {
   local user="${1:-0}" mode providers autofill secure_state failure stored_failure profile reason
   local profile_status stability credential_key_state primary_key_state autofill_key_state auto_apply
   mode=$(requested_mode "")
-  providers=$(choose_gms_provider_list "$user")
-  autofill=$(choose_gms_autofill_provider "$user")
+  if [ "$#" -ge 3 ]; then
+    providers=$2
+    autofill=$3
+  else
+    providers=$(choose_gms_provider_list "$user")
+    autofill=$(choose_gms_autofill_provider "$user")
+  fi
   settings_get "$user" credential_service >/dev/null 2>&1 \
     && credential_key_state=present || credential_key_state=unsupported
   settings_get "$user" credential_service_primary >/dev/null 2>&1 \
@@ -1810,7 +1789,10 @@ capability_snapshot() {
   echo "profile=$profile"
   echo "profile_status=$profile_status"
   echo "user_state=$(user_state "$user")"
-  echo "gms_state=$(gms_state "$user")"
+  if ! gms_installed "$user"; then echo gms_state=missing
+  elif gms_package_disabled "$user"; then echo gms_state=disabled
+  elif [ -n "$providers" ]; then echo gms_state=ready
+  else echo gms_state=visible; fi
   echo "credential_feature=$(credential_feature_state)"
   echo "provider_query=$(provider_query_state "$user")"
   echo "secure_keys=$secure_state"
@@ -1855,7 +1837,7 @@ show_status() {
     providers=$(build_gms_provider_list "$discovered")
     autofill=$(choose_gms_autofill_provider "$user")
     echo "=== User $user capabilities ==="
-    capability_snapshot "$user"
+    capability_snapshot "$user" "$providers" "$autofill"
     echo ""
     echo "=== User $user routing ==="
     echo "discovered GMS providers:"
@@ -1893,6 +1875,12 @@ report_seconds_left() {
 capture_report_command() {
   local destination="$1" summary="$2" section_id="$3" requested="$4" line_limit="$5" deadline="$6"
   shift 6
+  capture_report_filtered "$destination" "$summary" "$section_id" "$requested" '' "$line_limit" "$deadline" "$@"
+}
+
+capture_report_filtered() {
+  local destination="$1" summary="$2" section_id="$3" requested="$4" pattern="$5" line_limit="$6" deadline="$7"
+  shift 7
   local temporary_file status remaining seconds start finish elapsed section_status
   temporary_file="$destination.$section_id.$$.tmp"
   remaining=$(report_seconds_left "$deadline")
@@ -1906,7 +1894,11 @@ capture_report_command() {
   start=$(epoch_seconds)
   run_with_timeout "$seconds" "$@" > "$temporary_file" 2>&1
   status=$?
-  head -n "$line_limit" "$temporary_file" >> "$destination" 2>/dev/null || true
+  if [ -n "$pattern" ]; then
+    grep -Ei "$pattern" "$temporary_file" | head -n "$line_limit" >> "$destination" 2>/dev/null || true
+  else
+    head -n "$line_limit" "$temporary_file" >> "$destination" 2>/dev/null || true
+  fi
   case "$status" in
     0) section_status=ok ;;
     124|137|143)
@@ -1923,43 +1915,6 @@ capture_report_command() {
   [ "$elapsed" -ge 0 ] 2>/dev/null || elapsed=0
   echo "section=$section_id status=$section_status elapsed=${elapsed}s" >> "$summary"
   rm -f "$temporary_file" 2>/dev/null || true
-}
-
-capture_report_filtered() {
-  local destination="$1" summary="$2" section_id="$3" requested="$4" pattern="$5" line_limit="$6" deadline="$7"
-  shift 7
-  local temporary_file filtered_file status remaining seconds start finish elapsed section_status
-  temporary_file="$destination.$section_id.$$.tmp"
-  filtered_file="$temporary_file.filtered"
-  remaining=$(report_seconds_left "$deadline")
-  if [ "$remaining" -le 0 ]; then
-    echo "[skipped: report total budget exhausted]" >> "$destination"
-    echo "section=$section_id status=skipped elapsed=0s" >> "$summary"
-    return 0
-  fi
-  seconds="$requested"
-  [ "$remaining" -lt "$seconds" ] && seconds="$remaining"
-  start=$(epoch_seconds)
-  run_with_timeout "$seconds" "$@" > "$temporary_file" 2>&1
-  status=$?
-  grep -Ei "$pattern" "$temporary_file" | head -n "$line_limit" > "$filtered_file" 2>/dev/null || true
-  cat "$filtered_file" >> "$destination" 2>/dev/null || true
-  case "$status" in
-    0) section_status=ok ;;
-    124|137|143)
-      section_status=timeout
-      echo "[timed out after ${seconds}s]" >> "$destination"
-      ;;
-    *)
-      section_status=failed
-      echo "[command exited with status $status]" >> "$destination"
-      ;;
-  esac
-  finish=$(epoch_seconds)
-  elapsed=$((finish - start))
-  [ "$elapsed" -ge 0 ] 2>/dev/null || elapsed=0
-  echo "section=$section_id status=$section_status elapsed=${elapsed}s" >> "$summary"
-  rm -f "$temporary_file" "$filtered_file" 2>/dev/null || true
 }
 
 sanitize_report() {
@@ -2004,9 +1959,11 @@ collect_report() {
     *) echo "invalid report mode: $report_mode" >&2; return 2 ;;
   esac
   timestamp=$(date '+%Y%m%d-%H%M%S' 2>/dev/null || echo now)
-  report_file="$LOG_DIR/report-$report_mode-$timestamp-$$.txt"
-  raw_file="$report_file.raw"
-  summary_file="$report_file.summary.tmp.$$"
+  report_file=$(mktemp "$LOG_DIR/report-$report_mode-$timestamp-XXXXXX") || return 1
+  mv "$report_file" "$report_file.txt" || return 1
+  report_file="$report_file.txt"
+  raw_file=$(mktemp "${HYPERGPM_TIMEOUT_DIR:-$DATA_DIR}/report.XXXXXX") || { rm -f "$report_file"; return 1; }
+  summary_file="$raw_file.summary"
   : > "$raw_file" 2>/dev/null || return 1
   : > "$summary_file" 2>/dev/null || { rm -f "$raw_file" 2>/dev/null || true; return 1; }
   started=$(epoch_seconds)
@@ -2025,10 +1982,7 @@ collect_report() {
   } >> "$raw_file"
 
   report_progress "device, providers and secure settings"
-  (
-    HYPERGPM_DISABLE_TIMEOUT_CMD=1
-    capture_report_command "$raw_file" "$summary_file" status 12 260 "$deadline" show_status
-  )
+  capture_report_command "$raw_file" "$summary_file" status 12 260 "$deadline" show_status
 
   report_progress "Credential Manager state"
   {
@@ -2089,8 +2043,7 @@ collect_report() {
     fi
   fi
 
-  failure=$(classify_recent_failure)
-  echo "$failure" > "$STATE_DIR/last-failure-class" 2>/dev/null || true
+  failure=$(classify_failure_text "$(tail -n 220 "$raw_file")")
   {
     echo ""
     echo "=== Collection summary ==="
@@ -2128,4 +2081,19 @@ open_settings_pages() {
     return 1
   fi
   return 0
+}
+
+# Entry-level budget includes discovery, backoff and a delayed read-only check.
+boot_cycle() {
+  local source="${1:-boot}" HYPERGPM_BOOT_PATH=1 HYPERGPM_ALLOW_PACKAGE_DUMP=0 mode
+  apply_google_route_once_per_boot "$source" || true
+  sleep 15
+  if [ -f "$STATE_DIR/deferred-users" ] && [ ! -f "$STATE_DIR/restore-paused" ]; then
+    mode=$(requested_mode '')
+    if acquire_apply_lock "$source" 3; then
+      apply_google_route_under_lock '' "$mode" || true
+      release_apply_lock
+    fi
+  fi
+  verify_owned_routes_once "$source"
 }

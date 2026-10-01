@@ -3,17 +3,22 @@
 Developer: **framelix**
 
 - 模块 ID：`hypergpm-router`
-- 版本：`0.4.0-beta`
+- 版本：`1.0.0`
 - 运行环境：SukiSU Ultra / KernelSU 风格 systemless 模块
 
-## 当前版本：0.4.0-beta
+## 当前版本：1.0.0
 
-相较于上一个 GitHub 版本 `0.2.0-alpha`，本次更新包含两个方面：
+本次为 1.0 正式版，以保留正常功能、兼容保护和恢复能力为前提：
 
-- **兼容性**：新增 HyperOS / Android API 双轴兼容档案、API37 服务输出解析、只读 framework overlay 探测，以及按设置键记录能力和恢复所有权。OS4 和 API37 默认保持 `observe-only`，可通过显式命令进行测试。
-- **运行效率与共存**：新增成功状态指纹，稳定重复 apply 不再重新发现 provider 或写入设置；KernelSU/SukiSU 优先使用 `boot-completed.sh`；新增有界模块冲突检测、路由漂移保护、日志轮转和显式 `restore force`。
+- **精简重复工作**：合并设置读写重试、报告采集与字段解析；复用同次状态查询的服务发现结果；成功读取不再逐次写日志，保留错误、重试和诊断信息。
+- **更可靠的缓存**：指纹覆盖模块版本、策略文件、兼容档案、用户和 GMS 状态。稳定重复 apply 不写设置、不做完整服务发现、不读取 package dump/logcat；仍读取三个设置，并对已选 GMS 服务执行当前用户的定向 action/权限验证。观察、锁定用户、部分失败和不可读状态不缓存为成功。
+- **减少设置争抢**：apply、restore 和卸载共用带进程身份的锁；开机流程独立检查已有路由所有权，依赖变化也不会绕过漂移保护。restore 后暂停自动接管，直到显式执行 `apply conservative` 或 `apply force`。
+- **可恢复的写入**：每次修改前保存事务意图，异常中断后只回滚仍匹配本次目标的键；已提交的所有权不会被误回滚。按键扩展原值备份，保留旧版备份恢复能力。
+- **有界的临时任务**：统一超时和子进程树清理，限制无换行诊断输出，嵌套命令共用可清理的临时目录。冲突扫描包含枚举预算，忽略禁用/待删除模块；扫描不完整时不会报告“无冲突”。
 
-本版本为实验性 beta。主机合成测试与发布包检查不代表真机验证；OS3/API36、OS4/API36 的最终 ZIP 测试及真实 passkey 创建、重启、恢复流程仍待完成，API37 尚未验证。详细变更见下方版本说明和 [CHANGELOG](CHANGELOG.md)。
+同一主机、相同 Android 合成夹具各运行三次，完整 Action 中位耗时由约 4.63 秒降至 3.79 秒，完整服务查询由 66 次降至 36 次；公开报告由约 1.28 秒降至 0.97 秒。测量执行实际入口脚本，排除夹具准备和预设启动等待；这些结果不代表真机时延或耗电。稳定路径保留必要服务验证，不以省略检查换取调用次数。
+
+主机回归、真实子进程中断测试和 ZIP 文件白名单检查用于验证脚本行为，不能证明 Android 真机 passkey 功能或耗电表现。本版本标记为 **1.0.0 正式版**，以主机回归和发布包审计作为发布检查；真机验证不再作为发布前置条件。当前尚未进行 BusyBox ash 及目标设备验证。OS4/API37 默认兼容保护保持不变。详细变更见 [CHANGELOG](CHANGELOG.md)。
 
 ## 这是什么
 
@@ -45,18 +50,18 @@ Android Credential Manager 会聚合设备上可用的 credential providers，�
 - Credential provider 与 Autofill 分开决策。保守模式只在 Autofill 为空、已经是 Google，或当前为 Xiaomi/MIUI Autofill 时切换到经过验证的 GMS Autofill。
 - 重建 provider 列表时尽量过滤 Xiaomi / MIUI / FIDO 相关组件。
 - 对每个 Android 用户分别应用设置，并在写入后逐键回读；临时 Binder 事务失败会有限重试。Credential 关键键在 conservative 下保持原子，Autofill 独立降级，force 测试支持按键级 `unsupported`。
-- 保存不含账号信息的最小成功指纹。构建、用户、GMS、模块目录和三个设置值未变化时，重复 apply 只做快速检查，不重新发现 provider、不运行 package dump/logcat，也不写 settings。
-- `boot-completed.sh` 是 KernelSU/SukiSU 的主入口；`service.sh` 只为不提供该阶段的管理器启动最长 120 秒的兼容回退，不留下常驻进程。
-- Action 与开机流程使用带 owner 类型和等待上限的互斥锁。Action 最多等待 3 秒；只读报告不依赖 apply lock。
+- 保存不含账号信息的成功指纹。模块、策略、兼容档案、构建、用户、GMS 和路由均匹配时，重复 apply 只做轻量读取及已选服务定向验证，不做完整 provider 发现、不运行 package dump/logcat，也不写 settings。
+- `boot-completed.sh` 是 KernelSU/SukiSU 的主入口，路由和延迟检查总窗口为 90 秒；其他管理器的兼容回退最多等待开机 120 秒，再进入 90 秒路由窗口，外层总上限 210 秒（不含短暂清理开销）。结束后无常驻进程。
+- Action、开机、restore 和卸载使用带进程身份、owner 类型和等待上限的同一互斥锁。Action 最多等待 3 秒；只读报告不依赖 apply lock。
 - 只读扫描其他模块可能存在的设置写入、GMS 冻结/组件管理、深层 passkey hook 和 framework overlay。扫描最多 64 个模块、每模块 12 个文件、总计 128 个文件、单文件 64 KiB、总预算 4 秒，不执行或修改其他模块。
 - 如果本模块写入后的路由被用户或其他模块改变，自动开机流程停止重写并记录 ownership conflict，避免循环争抢。
 - 提供 SukiSU Ultra 模块页 Action 按钮，可一键应用、查看状态、生成诊断报告并打开相关设置页面。
 - Action 的 status、apply、report、open 是四个独立且有硬超时的进程；前一步失败不会拖死后一步。
 - 诊断报告分为默认 `public` 和显式 `private`；每个 section 及报告总流程都有时间预算，公开报告自动过滤常见账号、网络、设备标识、宿主路径和 token 模式。
 - 诊断报告保存到 `/data/adb/hypergpm-router/logs/`，最多保留最近 5 份；运行日志超过 128 KiB 后最多轮转两代。
-- 首次写入时备份原始 secure settings。restore/卸载只恢复当前仍等于模块最后写入值的键，保留用户之后的新选择。
+- 首次管理某个键时备份原始 secure settings。restore/卸载只恢复当前仍等于模块最后写入值且有备份的键，保留用户之后的新选择；锁定用户留待解锁后恢复。
 
-## 0.4.0-beta 新增内容
+## 0.4.0-beta 历史新增内容
 
 - 新增 stable-state 快速路径和最小成功指纹。合成基准中，完整 apply 为 12 次 settings get、3 次 put、6 次 provider query、2 次 package dump、1 次 logcat；稳定重复 apply 为 3 次 settings get、0 次 put、0 次 provider query、0 次 dumpsys、0 次 logcat。
 - KernelSU/SukiSU 开机流程改为直接使用 `boot-completed.sh`。`service.sh` 在 KernelSU 环境立即退出，兼容 watchdog 最长存活 120 秒。
@@ -284,4 +289,4 @@ HyperPasskey 是一个通过 Xposed / LSPosed hook 修复 HyperOS passkey 行为
 
 ## 免责声明
 
-这是 `0.4.0-beta` 实验模块，面向愿意自行排障的高级用户。它会以 root 权限写入 Android secure settings，不同 HyperOS 构建的行为可能不同。OS4/API37 的 fixture 结果不等于真机 passkey 创建成功；发布 issue 时请先检查诊断报告，如果 ROM 拒绝该路由，请使用 restore 或卸载模块恢复原设置。
+这是 `1.0.0` 正式版模块，面向愿意自行排障的高级用户。它会以 root 权限写入 Android secure settings，不同 HyperOS 构建的行为可能不同。OS4/API37 的 fixture 结果不等于真机 passkey 创建成功；发布 issue 时请先检查诊断报告，如果 ROM 拒绝该路由，请使用 restore 或卸载模块恢复原设置。
